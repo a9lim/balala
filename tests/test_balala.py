@@ -339,6 +339,9 @@ def test_vdf_set_edits_in_place():
     changed = balala.vdf_set(added, path, "launchoptions", "%command% -x")  # replaces just the value
     assert changed == added.replace('"WINEDLLOVERRIDES=\\"winmm=n,b\\" %command%"', '"%command% -x"')
 
+    crlf = balala.vdf_set(LOCALCONFIG.replace("\n", "\r\n"), path, "LaunchOptions", "x")
+    assert '"x"\r\n' in crlf and "\n" not in crlf.replace("\r\n", "")  # new lines match the file's endings
+
     fresh = balala.vdf_set(LOCALCONFIG, [*APPS, "999"], "LaunchOptions", "x")  # creates the game's block
     assert balala.dig(balala.parse_vdf(fresh), *[k.lower() for k in APPS], "999", "launchoptions") == "x"
     assert balala.vdf_set(LOCALCONFIG, ["nope", "999"], "LaunchOptions", "x") is None

@@ -363,7 +363,8 @@ class Linux(Platform):
         for root in existing(steam_roots(self)):
             for cfg in _localconfigs(root):
                 try:
-                    text = cfg.read_text(encoding="utf-8", errors="surrogateescape")
+                    with open(cfg, encoding="utf-8", errors="surrogateescape", newline="") as f:
+                        text = f.read()  # newline="": no line-ending translation, so edits stay byte-exact
                 except OSError:
                     continue
                 opts = dig(parse_vdf(text), *LAUNCH_OPTIONS_PATH, APP_ID, "launchoptions")
@@ -387,7 +388,8 @@ class Linux(Platform):
             if not backup.exists():
                 shutil.copyfile(cfg, backup)
             part = cfg.with_name(cfg.name + ".balala-part")
-            part.write_text(new, encoding="utf-8", errors="surrogateescape")
+            with open(part, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                f.write(new)
             os.replace(part, cfg)
             done.append(backup)
         if not done:
@@ -478,6 +480,7 @@ def vdf_set(text: str, path: list[str], key: str, value: str) -> str | None:
             pending = None
     if value_span:
         return text[: value_span[0]] + esc + text[value_span[1] :]
+    nl = "\r\n" if "\r\n" in text else "\n"  # match the file's line endings
 
     def indent_at(pos: int) -> tuple[int, str]:
         line_start = text.rfind("\n", 0, pos) + 1
@@ -486,10 +489,10 @@ def vdf_set(text: str, path: list[str], key: str, value: str) -> str | None:
 
     if close is not None:
         at, lead = indent_at(close)
-        return text[:at] + f'{lead}\t"{key}"\t\t"{esc}"\n' + text[at:]
+        return text[:at] + f'{lead}\t"{key}"\t\t"{esc}"{nl}' + text[at:]
     if parent_close is not None:
         at, lead = indent_at(parent_close)
-        block = f'{lead}\t"{path[-1]}"\n{lead}\t{{\n{lead}\t\t"{key}"\t\t"{esc}"\n{lead}\t}}\n'
+        block = f'{lead}\t"{path[-1]}"{nl}{lead}\t{{{nl}{lead}\t\t"{key}"\t\t"{esc}"{nl}{lead}\t}}{nl}'
         return text[:at] + block + text[at:]
     return None
 
