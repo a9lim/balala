@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0 (2026-11-12)
+
+- On Linux, balala sets Balatro's Steam launch options itself, adding `WINEDLLOVERRIDES="winmm=n,b"` to whatever was
+  there. It waits until Steam is closed, since Steam rewrites its config on exit, and backs that config up first.
+- On PyPI: `uv tool install balala` or `pipx install balala`.
+
 ## 0.1.1 (2026-11-12)
 
 - `balala update` also updates balala to its newest release, the way it was installed: `uv tool`, pipx, pip, or the

@@ -32,7 +32,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "1.0.0"
 
 APP_ID = "2379780"  # Balatro's Steam app id
 LOVELY_REPO = "ethangreen-dev/lovely-injector"
@@ -166,12 +166,11 @@ class Game:
     library: Path | None  # the Steam library it's in, when known
 
 
-def _pgrep(pattern: str) -> bool:
+def _pgrep(pattern: str, exact: bool = False) -> bool:
     if not shutil.which("pgrep"):
         return False
-    return (
-        subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    )
+    args = ["pgrep", "-x" if exact else "-f", pattern]
+    return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 class Platform:
@@ -206,7 +205,7 @@ class Platform:
     def launch(self, game: Game) -> None:
         raise NotImplementedError
 
-    def hints(self, game: Game, lovely_files: list[str]) -> list[str]:
+    def hints(self, game: Game, lovely_files: list[str], fix: bool = False) -> list[str]:
         """Setup the user still has to do by hand."""
         return []
 
@@ -347,21 +346,54 @@ class Linux(Platform):
             start_new_session=True,
         )
 
-    def hints(self, game, lovely_files):
-        stems = [Path(f).stem.lower() for f in lovely_files if f.lower().endswith(".dll")]
-        if not stems:
+    def steam_running(self) -> bool:
+        if _pgrep("steam", exact=True):
+            return True
+        try:  # Steam writes its pid here while it runs
+            os.kill(int((Path.home() / ".steam/steam.pid").read_text().strip()), 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def hints(self, game, lovely_files, fix=False):
+        dlls = [Path(f).stem.lower() for f in lovely_files if f.lower().endswith(".dll")]
+        if not dlls:
             return []
+        pending = []
         for root in existing(steam_roots(self)):
             for cfg in _localconfigs(root):
                 try:
-                    data = parse_vdf(cfg.read_text(encoding="utf-8", errors="replace"))
+                    text = cfg.read_text(encoding="utf-8", errors="surrogateescape")
                 except OSError:
                     continue
-                opts = dig(data, "userlocalconfigstore", "software", "valve", "steam", "apps", APP_ID, "launchoptions")
-                if isinstance(opts, str) and loads_native(opts, stems):
+                opts = dig(parse_vdf(text), *LAUNCH_OPTIONS_PATH, APP_ID, "launchoptions")
+                opts = opts if isinstance(opts, str) else ""
+                if loads_native(opts, dlls):
                     return []
-        overrides = ";".join(f"{s}=n,b" for s in stems)
-        return [f'in Steam, set Balatro\'s launch options to: WINEDLLOVERRIDES="{overrides}" %command%']
+                pending.append((cfg, text, opts))
+        wanted = with_override("", dlls)
+        if not pending:
+            return [f"in Steam, set Balatro's launch options to: {wanted}"]
+        if not fix:
+            return [f"Balatro's Steam launch options need: {wanted}"]
+        if self.steam_running():  # Steam rewrites its config on exit, so an edit now wouldn't stick
+            return [f"close Steam and run `balala setup` so balala can set Balatro's launch options to: {wanted}"]
+        done = []
+        for cfg, text, opts in pending:
+            new = vdf_set(text, [*LAUNCH_OPTIONS_PATH, APP_ID], "LaunchOptions", with_override(opts, dlls))
+            if new is None:
+                continue
+            backup = cfg.with_name(cfg.name + ".balala-backup")
+            if not backup.exists():
+                shutil.copyfile(cfg, backup)
+            part = cfg.with_name(cfg.name + ".balala-part")
+            part.write_text(new, encoding="utf-8", errors="surrogateescape")
+            os.replace(part, cfg)
+            done.append(backup)
+        if not done:
+            return [f"in Steam, set Balatro's launch options to: {wanted}"]
+        note(f"set Balatro's Steam launch options so lovely loads (the old config is in {tilde(done[0])})")
+        return []
 
 
 def _localconfigs(steam: Path) -> list[Path]:
@@ -390,6 +422,76 @@ def loads_native(launch_options: str, dlls: list[str]) -> bool:
         for dll in names.split(","):
             modes[dll.strip().lower()] = mode.strip().lower()
     return all(modes.get(d, "").startswith("n") for d in dlls)
+
+
+LAUNCH_OPTIONS_PATH = ("userlocalconfigstore", "software", "valve", "steam", "apps")
+_OVERRIDES = re.compile(r"WINEDLLOVERRIDES\s*=\s*(\"[^\"]*\"|'[^']*'|\S+)", re.IGNORECASE)
+
+
+def with_override(launch_options: str, dlls: list[str]) -> str:
+    """Launch options that also make Wine load these DLLs natively, keeping whatever else was there."""
+    if launch_options and loads_native(launch_options, dlls):
+        return launch_options
+    want = ";".join(f"{d}=n,b" for d in dlls)
+    opts = launch_options.strip()
+    m = _OVERRIDES.search(opts)
+    if "%command%" not in opts.lower():  # without %command%, Steam treats options as the game's arguments
+        if not m:
+            return f'WINEDLLOVERRIDES="{want}" %command% {opts}'.strip()
+        opts = f"{opts[: m.end()]} %command%{opts[m.end() :]}"
+        if loads_native(opts, dlls):
+            return opts
+        m = _OVERRIDES.search(opts)
+    if m:  # add ours after the overrides already there (later entries win)
+        merged = m.group(1).strip("\"'").rstrip(";")
+        return f'{opts[: m.start()]}WINEDLLOVERRIDES="{merged};{want}"{opts[m.end() :]}'
+    return f'WINEDLLOVERRIDES="{want}" {opts}'
+
+
+def vdf_set(text: str, path: list[str], key: str, value: str) -> str | None:
+    """Set `key` in the KeyValues block at `path` (keys match case-insensitively), editing the text in
+    place so everything else stays byte-for-byte. Creates the block itself if its parent exists;
+    None if the parent doesn't."""
+    path = [p.lower() for p in path]
+    esc = value.replace("\\", "\\\\").replace('"', '\\"')
+    stack: list[str] = []
+    pending: str | None = None
+    value_span = close = parent_close = None
+    for m in re.finditer(r'"((?:\\.|[^"\\])*)"|([{}])', text):
+        quoted, brace = m.group(1), m.group(2)
+        if brace == "{":
+            stack.append((pending or "").lower())
+            pending = None
+        elif brace == "}":
+            if stack == path and close is None:
+                close = m.start()
+            elif stack == path[:-1] and parent_close is None:
+                parent_close = m.start()
+            if stack:
+                stack.pop()
+            pending = None
+        elif pending is None:
+            pending = quoted
+        else:
+            if stack == path and pending.lower() == key.lower() and value_span is None:
+                value_span = (m.start(1), m.end(1))
+            pending = None
+    if value_span:
+        return text[: value_span[0]] + esc + text[value_span[1] :]
+
+    def indent_at(pos: int) -> tuple[int, str]:
+        line_start = text.rfind("\n", 0, pos) + 1
+        lead = text[line_start:pos]
+        return (line_start, lead) if not lead.strip() else (pos, "")
+
+    if close is not None:
+        at, lead = indent_at(close)
+        return text[:at] + f'{lead}\t"{key}"\t\t"{esc}"\n' + text[at:]
+    if parent_close is not None:
+        at, lead = indent_at(parent_close)
+        block = f'{lead}\t"{path[-1]}"\n{lead}\t{{\n{lead}\t\t"{key}"\t\t"{esc}"\n{lead}\t}}\n'
+        return text[:at] + block + text[at:]
+    return None
 
 
 def current_platform() -> Platform:
@@ -1401,7 +1503,7 @@ def ensure_lovely() -> Result:
             result = Result("updated", f"{tag} (reinstalled)")
         else:
             result = Result("updated", f"{rec.get('ref')} → {tag}")
-    for hint in ENV.plat.hints(game, lovely_files()):
+    for hint in ENV.plat.hints(game, lovely_files(), fix=True):
         note(hint)
     return result
 
@@ -1652,7 +1754,7 @@ def cmd_launch() -> int:
     if game_running():
         print("Balatro is already running.")
         return 0
-    for hint in ENV.plat.hints(game, lovely_files()):
+    for hint in ENV.plat.hints(game, lovely_files(), fix=True):
         warn(hint)
     ENV.plat.launch(game)
     mods = len(mod_folders())

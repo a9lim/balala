@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "balala"
 dynamic = ["version"]
-description = "One command for modded Balatro: installs lovely, Steamodded and Amulet, installs and updates mods from a link, and launches the game."
+description = "One command for modded Balatro: installs lovely, Steamodded and Amulet, installs and updates mods by name or link, and launches the game."
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
@@ -13,7 +13,7 @@ requires-python = ">=3.9"
 authors = [{ name = "a9lim", email = "mx@a9l.im" }, { name = "Claude" }]
 keywords = ["balatro", "mod-manager", "steamodded", "lovely", "modding", "cli"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: End Users/Desktop",
   "Operating System :: MacOS",

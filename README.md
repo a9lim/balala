@@ -1,7 +1,8 @@
 # balala
 
+[![PyPI](https://img.shields.io/pypi/v/balala.svg)](https://pypi.org/project/balala/)
 [![CI](https://github.com/a9lim/balala/actions/workflows/ci.yml/badge.svg)](https://github.com/a9lim/balala/actions/workflows/ci.yml)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://github.com/a9lim/balala/blob/main/LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![macOS | Windows | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 
@@ -35,9 +36,9 @@ $ balala update
 You need Balatro from Steam, Python 3.9 or newer, and git.
 
 ```sh
-uv tool install git+https://github.com/a9lim/balala
+uv tool install balala
 # or
-pipx install git+https://github.com/a9lim/balala
+pipx install balala
 ```
 
 balala is one file with no dependencies, so you can also download `balala.py` from the
@@ -109,12 +110,15 @@ to that channel. lovely, which is compiled, and balala itself always move to the
 
 balala finds the game through Steam's library list, including extra libraries on other drives.
 
-**Linux** needs one thing done by hand, because Steam doesn't let other programs change its settings. Set
-Balatro's launch options to `WINEDLLOVERRIDES="winmm=n,b" %command%`, and launch the game once from Steam before
-using balala so Proton creates its prefix. balala reminds you until the option is set.
+**Linux:** launch Balatro once from Steam before using balala, so Proton creates its prefix. For lovely to load
+under Proton, Balatro's Steam launch options need `WINEDLLOVERRIDES="winmm=n,b" %command%`. balala adds that itself,
+keeping any options you already have, and backs up Steam's config (`localconfig.vdf`) first. Steam rewrites that
+file when it exits, so balala only edits it while Steam is closed and otherwise asks you to close Steam.
+(Balatro has no Linux build on Steam, so Steam always runs it through Proton.)
 
 macOS has been tested end to end with the real game. On Windows and Linux, CI runs install, update and removal
-with real mods, but the launch step hasn't been run against the real game yet. Reports are welcome.
+with real mods, and the Steam config edit is tested against sample configs, but nobody has launched the real game
+there yet. Reports are welcome.
 
 ## What it touches
 
@@ -150,8 +154,8 @@ uv run --group dev pytest -m "not network" # offline only
 uv run --group dev ruff check && uv run --group dev ruff format --check
 ```
 
-To release, bump `__version__` in `balala.py`, add a `CHANGELOG.md` entry, and push a `vX.Y.Z` tag. CI builds the
-release.
+To release, bump `__version__` in `balala.py`, add a `CHANGELOG.md` entry, and push a `vX.Y.Z` tag. CI builds it,
+makes the GitHub release, and publishes to PyPI.
 
 ## Credits
 
@@ -160,4 +164,4 @@ Built by a9 and Claude.
 lovely, Steamodded and Amulet are their authors' work. balala downloads them, and every mod, from upstream and
 redistributes nothing. balala isn't affiliated with LocalThunk or Playstack.
 
-Licensed under the [GNU General Public License v3.0 or later](LICENSE).
+Licensed under the [GNU General Public License v3.0 or later](https://github.com/a9lim/balala/blob/main/LICENSE).

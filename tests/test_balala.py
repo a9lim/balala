@@ -299,6 +299,83 @@ def test_launch_options_of_the_signed_in_account(tmp_path, monkeypatch):
     assert balala.Linux().hints(game, ["winmm.dll"]) == []
 
 
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        ("", 'WINEDLLOVERRIDES="winmm=n,b" %command%'),
+        ("gamemoderun %command%", 'WINEDLLOVERRIDES="winmm=n,b" gamemoderun %command%'),
+        ("-windowed", 'WINEDLLOVERRIDES="winmm=n,b" %command% -windowed'),  # bare options are the game's arguments
+        ('WINEDLLOVERRIDES="d3d11=n" %command%', 'WINEDLLOVERRIDES="d3d11=n;winmm=n,b" %command%'),
+        ('WINEDLLOVERRIDES="winmm=b" %command%', 'WINEDLLOVERRIDES="winmm=b;winmm=n,b" %command%'),  # later wins
+        ('WINEDLLOVERRIDES="winmm=n,b"', 'WINEDLLOVERRIDES="winmm=n,b" %command%'),
+        ('WINEDLLOVERRIDES="winmm=n,b" %command%', 'WINEDLLOVERRIDES="winmm=n,b" %command%'),  # already right
+    ],
+)
+def test_with_override(before, after):
+    assert balala.with_override(before, ["winmm"]) == after
+    assert balala.loads_native(after, ["winmm"])
+
+
+LOCALCONFIG = (
+    '"UserLocalConfigStore"\n{\n\t"Software"\n\t{\n\t\t"Valve"\n\t\t{\n\t\t\t"Steam"\n\t\t\t{\n'
+    '\t\t\t\t"apps"\n\t\t\t\t{\n'
+    '\t\t\t\t\t"2379780"\n\t\t\t\t\t{\n\t\t\t\t\t\t"LastPlayed"\t\t"1700000000"\n\t\t\t\t\t}\n'
+    '\t\t\t\t\t"620"\n\t\t\t\t\t{\n\t\t\t\t\t\t"LaunchOptions"\t\t"-novid"\n\t\t\t\t\t}\n'
+    "\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n"
+    '\t"friends"\n\t{\n\t\t"PersonaName"\t\t"ünïcode \\"quoted\\""\n\t}\n}\n'
+)
+APPS = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"]
+
+
+def test_vdf_set_edits_in_place():
+    path = [*APPS, "2379780"]
+    added = balala.vdf_set(LOCALCONFIG, path, "LaunchOptions", 'WINEDLLOVERRIDES="winmm=n,b" %command%')
+    line = '\t\t\t\t\t\t"LaunchOptions"\t\t"WINEDLLOVERRIDES=\\"winmm=n,b\\" %command%"\n'
+    assert added == LOCALCONFIG.replace('"1700000000"\n', '"1700000000"\n' + line)  # one new line, nothing else
+    d = balala.parse_vdf(added)
+    assert balala.dig(d, *[k.lower() for k in path], "launchoptions") == 'WINEDLLOVERRIDES="winmm=n,b" %command%'
+    assert balala.dig(d, *[k.lower() for k in APPS], "620", "launchoptions") == "-novid"  # other games untouched
+
+    changed = balala.vdf_set(added, path, "launchoptions", "%command% -x")  # replaces just the value
+    assert changed == added.replace('"WINEDLLOVERRIDES=\\"winmm=n,b\\" %command%"', '"%command% -x"')
+
+    fresh = balala.vdf_set(LOCALCONFIG, [*APPS, "999"], "LaunchOptions", "x")  # creates the game's block
+    assert balala.dig(balala.parse_vdf(fresh), *[k.lower() for k in APPS], "999", "launchoptions") == "x"
+    assert balala.vdf_set(LOCALCONFIG, ["nope", "999"], "LaunchOptions", "x") is None
+
+
+def linux_steam(tmp_path, monkeypatch, running: bool) -> Path:
+    steam = tmp_path / "Steam"
+    cfg = steam / "userdata/11/config/localconfig.vdf"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_bytes(LOCALCONFIG.encode() + b"\xff\n")  # not valid UTF-8: must survive untouched
+    monkeypatch.setenv("BALALA_STEAM_DIR", str(steam))
+    monkeypatch.setattr(balala.Linux, "steam_running", lambda self: running)
+    return cfg
+
+
+def test_linux_sets_the_launch_option_itself(tmp_path, monkeypatch):
+    cfg = linux_steam(tmp_path, monkeypatch, running=False)
+    original = cfg.read_bytes()
+    game = balala.Game(tmp_path / "game", tmp_path)
+    assert balala.Linux().hints(game, ["winmm.dll"]) != []  # only fixes when asked to
+    assert balala.Linux().hints(game, ["winmm.dll"], fix=True) == []
+    assert cfg.with_name("localconfig.vdf.balala-backup").read_bytes() == original
+    assert cfg.read_bytes().endswith(b"\xff\n")
+    assert balala.Linux().hints(game, ["winmm.dll"]) == []  # now it's set
+    after = cfg.read_bytes()
+    assert balala.Linux().hints(game, ["winmm.dll"], fix=True) == []
+    assert cfg.read_bytes() == after  # and left alone from then on
+
+
+def test_linux_waits_for_steam_to_close(tmp_path, monkeypatch):
+    cfg = linux_steam(tmp_path, monkeypatch, running=True)
+    original = cfg.read_bytes()
+    (hint,) = balala.Linux().hints(balala.Game(tmp_path / "game", tmp_path), ["winmm.dll"], fix=True)
+    assert "close Steam" in hint
+    assert cfg.read_bytes() == original
+
+
 def test_linux_prefix_and_launch_options(tmp_path, monkeypatch):
     linux = balala.Linux()
     lib = tmp_path / "lib"
