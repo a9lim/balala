@@ -127,10 +127,10 @@ def note(msg: str) -> None:
         warn(msg)
 
 
-def run_jobs(jobs: list[tuple[str, Callable[[], Result]]]) -> int:
+def run_jobs(jobs: list[tuple[str, Callable[[], Result]]], width: int = 0) -> int:
     """Run jobs one line each, carrying on past failures; returns how many failed."""
     global _notes
-    width = max((len(label) for label, _ in jobs), default=0)
+    width = max(width, *(len(label) for label, _ in jobs), 0)
     live = _COLOR and sys.stdout.isatty()
     failed = 0
     for label, fn in jobs:
@@ -526,7 +526,6 @@ class Env:
         self.data = Path(data).expanduser() if data else self.plat.data_dir()
         self.cache = self.data / "cache" if data else self.plat.cache_dir()
         self.state_file = self.data / "state.json"
-        self.backups = self.data / "backups"
         self._game: Game | None = None
         self._mods: Path | None = None
 
@@ -662,14 +661,6 @@ def move(src: Path, dst: Path) -> None:
         rmtree(src)
 
 
-def fingerprint(folder: Path) -> str:
-    """A hash of every file in a folder, to tell whether anyone has changed a mod since it was installed."""
-    h = hashlib.sha256()
-    for p in sorted((p for p in folder.rglob("*") if p.is_file()), key=lambda p: p.relative_to(folder).as_posix()):
-        h.update(p.relative_to(folder).as_posix().encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest())
-    return h.hexdigest()
-
-
 @contextmanager
 def staging() -> Iterator[Path]:
     ENV.cache.mkdir(parents=True, exist_ok=True)
@@ -723,32 +714,12 @@ def place(src: Path, dest: Path) -> None:
         die(f"couldn't replace {dest.name}; close Balatro and try again")
 
 
-def backup(path: Path) -> Path:
-    ENV.backups.mkdir(parents=True, exist_ok=True)
-    dest = ENV.backups / f"{path.name}-{time.strftime('%Y%m%d-%H%M%S')}"
-    move(path, dest)
-    return dest
-
-
-def has_local_work(target: Path, rec: dict | None) -> bool:
-    """Whether a mod folder might hold someone's work. When in doubt, yes."""
-    if rec is None:
-        return True  # balala didn't install it
-    if is_clone(target):
-        return git_has_local_work(target, rec.get("base", rec.get("ref")) if rec.get("kind") == "git" else None)
-    return rec.get("files") is None or fingerprint(target) != rec["files"]
-
-
-def clear_target(target: Path, rec: dict | None) -> None:
-    """Make room for a new install. Deletes balala's own untouched copies; moves
-    anything that might hold someone's work to the backups folder instead."""
+def delete(target: Path) -> None:
+    """Remove a mod folder (or just the link, for a symlinked dev checkout)."""
     if target.is_symlink():
         target.unlink()
     elif target.exists():
-        if has_local_work(target, rec):
-            note(f"moved the old folder to {tilde(backup(target))}")
-        else:
-            rmtree(target)
+        rmtree(target)
 
 
 # ── git ───────────────────────────────────────────────────────────────────
@@ -776,27 +747,9 @@ def is_clone(path: Path) -> bool:
     return (path / ".git").exists()
 
 
-def git_dirty(path: Path, untracked: bool = False) -> bool:
-    """Edits to tracked files (and, with `untracked`, new or ignored files too). True if git can't tell."""
-    args = ["status", "--porcelain", "--ignored" if untracked else "--untracked-files=no"]
-    r = _git(tuple(args), path)
-    return r.returncode != 0 or bool(r.stdout.strip())
-
-
-def git_has_local_work(path: Path, base: str | None) -> bool:
-    """Any edits or files of the user's, or commits upstream doesn't have. A clone
-    still at `base` (the commit balala last put there) has no local commits, even
-    if upstream has rewritten its history since. Anything git can't answer counts
-    as work."""
-    if git_dirty(path, untracked=True):
-        return True
-    head = _git(("rev-parse", "HEAD"), path)
-    if head.returncode != 0:
-        return True
-    if base and head.stdout.strip() == base:
-        return False
-    ahead = _git(("rev-list", "--count", "@{u}..HEAD"), path)
-    return ahead.returncode != 0 or int(ahead.stdout.strip() or 0) > 0
+def git_dirty(path: Path) -> bool:
+    """Uncommitted edits to tracked files."""
+    return bool(git("status", "--porcelain", "--untracked-files=no", cwd=path, check=False))
 
 
 def norm_remote(url: str) -> str:
@@ -907,13 +860,16 @@ def check_name(name: str) -> str:
 
 
 def describe(rec: dict | None) -> str:
-    """How an install reads: a release tag, branch@commit, or sha256:… for an archive."""
+    """How an install reads: a release tag, branch@commit, sha256:… for an archive, or a hand install's version."""
     if not rec:
         return ""
-    if rec.get("kind") == "git":
+    kind = rec.get("kind")
+    if kind == "git":
         return f"{rec.get('on') or rec.get('branch') or 'HEAD'}@{rec['ref'][:7]}"
-    if rec.get("kind") == "archive":
+    if kind == "archive":
         return f"sha256:{rec['ref'][:7]}"
+    if kind == "manual":
+        return f"{rec['ref'] or '?'} (by hand)"
     return rec["ref"]
 
 
@@ -931,22 +887,17 @@ def outcome(old: dict | None, new: dict) -> Result:
     return Result("updated", transition(describe(old), describe(new)))
 
 
-def record(
-    name: str, src: Source, channel: str, kind: str, ref: str, *, base: str | None = None, files: str | None = None
-) -> dict:
+def record(name: str, src: Source, channel: str, kind: str, ref: str) -> dict:
     rec = {
         "source": src.url,
         "branch": src.branch,  # what was asked for; None means the default branch
         "channel": channel,  # what was asked for: latest | stable
-        "kind": kind,  # what's there: git | release | archive
-        "ref": ref,  # the commit checked out, or the tag / archive hash installed
+        "kind": kind,  # what's there: git | release | archive | manual (installed by hand, not yet replaced)
+        "ref": ref,  # the commit checked out, the tag or archive hash installed, or a hand install's version
         "updated": now(),
     }
     if kind == "git":
-        rec["base"] = base  # the last commit balala itself put there; None for a clone it adopted with work in it
         rec["on"] = git("rev-parse", "--abbrev-ref", "HEAD", cwd=ENV.mods / name, check=False)
-    else:
-        rec["files"] = files  # fingerprint of what balala unpacked, to spot later edits
     STATE["mods"][name] = rec
     save_state()
     return rec
@@ -955,6 +906,21 @@ def record(
 def canonical_name(name: str) -> str:
     """Folder names are case-insensitive on macOS and Windows, so treat them that way everywhere."""
     return next((k for k in STATE["mods"] if k.lower() == name.lower()), name)
+
+
+def key_for(src: Source) -> str | None:
+    """The name balala already manages this mod under, if any."""
+    return next((k for k, r in STATE["mods"].items() if same_remote(r["source"], src.url)), None)
+
+
+def core_name(name: str) -> str:
+    """Where a core mod lives: its usual folder, or wherever a hand install of it was found."""
+    return key_for(parse_source(CORE[name])) or name
+
+
+def is_core(name: str) -> bool:
+    rec = STATE["mods"].get(name)
+    return name in CORE if rec is None else any(same_remote(rec["source"], parse_source(r).url) for r in CORE.values())
 
 
 def ensure_mod(src: Source, channel: str, name: str | None = None) -> Result:
@@ -987,14 +953,13 @@ def _install_archive(name: str, target: Path, src: Source, rec: dict | None) -> 
     with staging() as tmp:
         root, digest = fetch_archive(src.url, tmp)
         if rec and rec.get("kind") == "archive" and rec.get("ref") == digest and target.is_dir():
-            if rec["source"] != src.url:  # same files from a new link: update from the new one from now on
+            if rec["source"] != src.url:  # the same files from a new link: update from the new one from now on
                 STATE["mods"][name] = {**rec, "source": src.url, "updated": now()}
                 save_state()
             return Result("current", describe(rec))
-        files = fingerprint(root)
-        clear_target(target, rec)
+        delete(target)
         move(root, target)
-    return outcome(rec, record(name, src, "latest", "archive", digest, files=files))
+    return outcome(rec, record(name, src, "latest", "archive", digest))
 
 
 def _install_release(name: str, target: Path, src: Source, rel: dict, rec: dict | None) -> Result:
@@ -1009,15 +974,14 @@ def _install_release(name: str, target: Path, src: Source, rel: dict, rec: dict 
         return Result("current", tag)
     with staging() as tmp:
         root, _ = fetch_archive(release_archive_url(src.repo, rel), tmp)
-        files = fingerprint(root)
-        clear_target(target, rec)
+        delete(target)
         move(root, target)
-    return outcome(rec, record(name, src, "stable", "release", tag, files=files))
+    return outcome(rec, record(name, src, "stable", "release", tag))
 
 
 def _install_git(name: str, target: Path, src: Source, rec: dict | None, channel: str) -> Result:
-    # Reuse the clone if it's this repo on the branch asked for. (A clone of a /tree/ branch
-    # doesn't count when the default branch is asked for: that's a switch.)
+    # Reuse the clone if it's this repo on the branch asked for. (Asking for the default
+    # branch after a /tree/<branch> link is a switch, so that reclones.)
     same_ask = rec is None or rec.get("kind") != "git" or rec.get("branch") == src.branch
     if (
         same_ask
@@ -1026,12 +990,8 @@ def _install_git(name: str, target: Path, src: Source, rec: dict | None, channel
     ):
         on = git("rev-parse", "--abbrev-ref", "HEAD", cwd=target, check=False)
         if not src.branch or on == src.branch:
-            if rec is None:
-                note("adopted the clone that was already there")
-            base = rec.get("base", rec["ref"]) if rec and rec.get("kind") == "git" else None
-            status, old, head = _git_sync(target, base)
-            # After a sync, HEAD is upstream's, so it's a clean base. A kept clone keeps the old one.
-            new = record(name, src, channel, "git", head, base=base if status == "kept" else head)
+            status, old, head = _git_sync(target)
+            new = record(name, src, channel, "git", head)
             if status == "current":
                 return Result("current", describe(new))
             if status == "kept":
@@ -1046,33 +1006,31 @@ def _install_git(name: str, target: Path, src: Source, rec: dict | None, channel
             if src.repo and api(f"repos/{src.repo}") is None:
                 die("no such GitHub repo (or it's private)")
             raise
-        clear_target(target, rec)
+        delete(target)
         move(dest, target)
-    head = git("rev-parse", "HEAD", cwd=target)
-    return outcome(rec, record(name, src, channel, "git", head, base=head))
+    return outcome(rec, record(name, src, channel, "git", git("rev-parse", "HEAD", cwd=target)))
 
 
-def _git_sync(path: Path, base: str | None) -> tuple[str, str, str]:
-    """Fast-forward a clone to upstream; returns (status, old HEAD, new HEAD). If upstream
-    rewrote its history, reset only a clone that's exactly as balala left it, with
-    nothing of the user's in it: local work is never discarded."""
+def _git_sync(path: Path) -> tuple[str, str, str]:
+    """Bring a clone up to date with upstream; returns (status, old HEAD, new HEAD).
+    Only uncommitted edits stop it: those are left alone."""
     git("fetch", "--quiet", "origin", cwd=path)
     head = git("rev-parse", "HEAD", cwd=path)
     up = git("rev-parse", "@{u}", cwd=path)
     if head == up:
         return "current", head, head
-    if not git_dirty(path) and git_ok("merge-base", "--is-ancestor", head, up, cwd=path):
-        git("merge", "--ff-only", "--quiet", up, cwd=path)  # refuses by itself if it would clobber untracked files
-    elif head == base and not git_dirty(path, untracked=True):
-        git("reset", "--hard", "--quiet", up, cwd=path)
-        note("upstream rewrote its history; reset to match")
-    else:
-        note("has local changes or commits. Commit or discard them, or remove and reinstall it")
+    if git_dirty(path):
+        note("has uncommitted changes, so it was left alone")
         return "kept", head, head
+    if git_ok("merge-base", "--is-ancestor", head, up, cwd=path):
+        git("merge", "--ff-only", "--quiet", up, cwd=path)
+    else:
+        git("reset", "--hard", "--quiet", up, cwd=path)
+        note("upstream's history changed, so it was reset to match (older commits are in `git reflog`)")
     return "updated", head, up
 
 
-# ── mod metadata (for dependency warnings) ────────────────────────────────
+# ── mod metadata ──────────────────────────────────────────────────────────
 
 
 def mod_headers(folder: Path) -> list[dict]:
@@ -1080,12 +1038,32 @@ def mod_headers(folder: Path) -> list[dict]:
     out = []
     for p in sorted(folder.glob("*.json")):
         try:
-            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            d = json.loads(p.read_text(encoding="utf-8-sig"), strict=False)
         except (OSError, ValueError):
             continue
         if isinstance(d, dict) and isinstance(d.get("id"), str) and "main_file" in d:
             out.append(d)
     return out
+
+
+def is_steamodded(folder: Path) -> bool:
+    """Steamodded has no JSON header of its own, so recognize it by its layout."""
+    return (folder / "version.lua").is_file() and (folder / "src").is_dir() and (folder / "lovely").is_dir()
+
+
+def mod_ids(folder: Path) -> dict[str, str]:
+    """The mod ids a folder declares, lowercased -> as written."""
+    ids = {h["id"].lower(): h["id"] for h in mod_headers(folder)}
+    if is_steamodded(folder):
+        ids["steamodded"] = "Steamodded"
+    for lua in folder.glob("*.lua"):  # old-style "--- MOD_ID:" headers
+        try:
+            m = re.search(r"^--- MOD_ID:\s*(\S+)", lua.read_text(errors="replace")[:2000], re.MULTILINE)
+        except OSError:
+            continue
+        if m:
+            ids.setdefault(m.group(1).lower(), m.group(1))
+    return ids
 
 
 def _dep_id(spec) -> str:
@@ -1106,18 +1084,9 @@ def installed_ids() -> set[str]:
     if STATE.get("lovely"):
         ids.add("lovely")
     for d in mod_folders():
-        if (d / "version.lua").is_file() and (d / "src").is_dir() and (d / "lovely").is_dir():
-            ids.add("steamodded")  # Steamodded has no JSON header of its own
+        ids.update(mod_ids(d))
         for h in mod_headers(d):
-            ids.add(h["id"].lower())
             ids.update(_dep_id(p) for p in h.get("provides") or [])
-        for lua in d.glob("*.lua"):  # old-style "--- MOD_ID:" headers
-            try:
-                m = re.search(r"^--- MOD_ID:\s*(\S+)", lua.read_text(errors="replace")[:2000], re.MULTILINE)
-            except OSError:
-                continue
-            if m:
-                ids.add(m.group(1).lower())
     return ids
 
 
@@ -1129,6 +1098,256 @@ def missing_deps(name: str) -> list[str]:
             if not any(_dep_id(alt) in have for alt in str(dep).split("|")):
                 out.append(f"{h['id']} needs {dep}, which isn't installed")
     return out
+
+
+def conflicts() -> list[str]:
+    """Mods Steamodded will refuse to load together: one id in two folders, or a mod
+    alongside one that replaces it (Amulet provides Talisman)."""
+    owners: dict[str, list[str]] = {}
+    shown: dict[str, str] = {}
+    folders = mod_folders()
+    for d in folders:
+        for low, written in mod_ids(d).items():
+            owners.setdefault(low, []).append(d.name)
+            shown.setdefault(low, written)
+    out = [f"{shown[i]} is installed twice ({' and '.join(f)}); remove one" for i, f in owners.items() if len(f) > 1]
+    for d in folders:
+        for h in mod_headers(d):
+            for p in h.get("provides") or []:
+                others = [f for f in owners.get(_dep_id(p), []) if f != d.name]
+                if others:
+                    out.append(
+                        f"{h['id']} replaces {' and '.join(others)}; remove {'it' if len(others) == 1 else 'them'}"
+                    )
+    return out
+
+
+# ── mods installed by hand, and finding mods by name ─────────────────────
+
+CATALOG_URL = "https://thunderstore.io/c/balatro/api/v1/package/"
+_catalog: list[dict] | None = None
+_repo_ids: dict[str, set[str]] = {}
+_dupes: dict[str, str] = {}  # folder -> the managed mod it's a second copy of
+GITHUB_REPO_URL = re.compile(r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)", re.IGNORECASE)
+
+
+def _norm(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _folder_stem(name: str) -> str:
+    """'Cryptid-main' and 'Cryptid-0.5.17d' (GitHub zip folders) are Cryptid."""
+    return re.sub(r"[-_ ](main|master|v?\d[\w.~+-]*)$", "", name, flags=re.IGNORECASE)
+
+
+def _github_url(url) -> str | None:
+    m = GITHUB_REPO_URL.match(str(url or ""))
+    if not m:
+        return None
+    repo = m.group(2)[:-4] if m.group(2).endswith(".git") else m.group(2)
+    return f"https://github.com/{m.group(1)}/{repo}"
+
+
+def catalog() -> list[dict]:
+    """Thunderstore's Balatro packages that link a GitHub repo, as {name, repo}. Cached for a
+    day; an old copy, or nothing, if it can't be fetched."""
+    global _catalog
+    if _catalog is None:
+        path = ENV.cache / "thunderstore.json"
+        try:
+            if not path.is_file() or time.time() - path.stat().st_mtime > 86400:
+                ENV.cache.mkdir(parents=True, exist_ok=True)
+                part = path.with_name(path.name + ".part")
+                download(CATALOG_URL, part)
+                os.replace(part, path)
+        except (Fail, OSError):
+            pass
+        try:
+            packages = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            packages = []
+        _catalog = []
+        for p in packages if isinstance(packages, list) else []:
+            if isinstance(p, dict) and not p.get("is_deprecated"):
+                repo = _github_url(((p.get("versions") or [{}])[0] or {}).get("website_url"))
+                if repo:
+                    _catalog.append({"name": str(p.get("name", "")), "repo": repo})
+    return _catalog
+
+
+def catalog_matches(names: set[str]) -> list[str]:
+    """Repos of catalog packages whose name, or whose repo's name, is one of `names` (normalized)."""
+    hits: dict[str, str] = {}
+    for p in catalog():
+        if names & {_norm(p["name"]), _norm(p["repo"].rsplit("/", 1)[-1])}:
+            hits.setdefault(norm_remote(p["repo"]), p["repo"])
+    return list(hits.values())
+
+
+def manifest_urls(folder: Path) -> list[str]:
+    """GitHub repos a mod's own metadata points at, like a Thunderstore manifest's website_url."""
+    urls = []
+    for p in sorted(folder.glob("*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8-sig"), strict=False)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            for key in ("website_url", "website", "homepage", "repository", "repo", "source"):
+                url = _github_url(d.get(key))
+                if url:
+                    urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+def repo_ids(repo: str) -> set[str]:
+    """The (lowercased) mod ids in a GitHub repo's top-level Steamodded headers."""
+    if repo not in _repo_ids:
+        ids = set()
+        listing = api(f"repos/{repo}/contents")
+        for f in listing if isinstance(listing, list) else []:
+            if f.get("type") != "file" or not f["name"].lower().endswith(".json") or not f.get("download_url"):
+                continue
+            try:
+                with _open(f["download_url"]) as r:
+                    d = json.loads(r.read().decode("utf-8-sig", errors="replace"), strict=False)
+            except (OSError, ValueError):
+                continue
+            if isinstance(d, dict) and isinstance(d.get("id"), str) and "main_file" in d:
+                ids.add(d["id"].lower())
+        _repo_ids[repo] = ids
+    return _repo_ids[repo]
+
+
+def search_github(name: str) -> list[str]:
+    """Repos named `name`, most-starred first, forks excluded."""
+    q = urllib.parse.quote(f"{name} in:name fork:false")
+    found = api(f"search/repositories?q={q}&sort=stars&order=desc&per_page=10") or {}
+    return [it["full_name"] for it in found.get("items", []) if _norm(it["name"]) == _norm(name)]
+
+
+def _verified(url: str, ids: set[str]) -> Source | None:
+    """`url` as a source, if that repo declares one of these mod ids."""
+    src = parse_source(url)
+    return src if src.repo and {_norm(i) for i in ids} & {_norm(i) for i in repo_ids(src.repo)} else None
+
+
+def identify(folder: Path) -> Source | None:
+    """Work out where a hand-installed mod came from: its git remote; else its own metadata,
+    Thunderstore, or a GitHub search. Those last three count only if the repo declares the same
+    mod id, so a different mod with the same name is never mistaken for it."""
+    if folder.is_symlink():
+        return None  # a dev checkout linked in: leave it be
+    if is_clone(folder):
+        url = git("remote", "get-url", "origin", cwd=folder, check=False)
+        try:
+            return parse_source(url) if url else None
+        except Fail:
+            return None
+    if is_steamodded(folder):
+        return parse_source(CORE["smods"])
+    headers = mod_headers(folder)
+    ids = set(mod_ids(folder))
+    if not ids:
+        return None  # no Steamodded header: nothing to check a match against
+    names = {_norm(v) for h in headers for v in (h.get("id"), h.get("name")) if isinstance(v, str)}
+    candidates = manifest_urls(folder) + catalog_matches((names | {_norm(_folder_stem(folder.name))}) - {""})
+    for url in dict.fromkeys(candidates):
+        src = _verified(url, ids)
+        if src:
+            return src
+    for h in headers:
+        for full in search_github(h["id"]):
+            src = _verified(f"https://github.com/{full}", ids)
+            if src:
+                return src
+    return None
+
+
+def find_by_name(name: str) -> Source | None:
+    """A mod by name, e.g. "Cryptid": a Thunderstore package or GitHub repo of that name whose
+    Steamodded header has that id."""
+    wanted = {_norm(name)}
+    candidates = catalog_matches(wanted) + [f"https://github.com/{full}" for full in search_github(name)]
+    for url in dict.fromkeys(candidates):
+        src = _verified(url, wanted)
+        if src:
+            return src
+    return None
+
+
+def guess_channel(folder: Path, src: Source) -> str:
+    """A hand install looks like a release if its folder name or header version names one of the repo's tags."""
+    if src.kind != "github":
+        return "latest"
+    hints = {_norm(h.get("version", "")).lstrip("v") for h in mod_headers(folder)}
+    m = re.search(r"[-_ ](v?\d[\w.~+-]*)$", folder.name)
+    if m:
+        hints.add(_norm(m.group(1)).lstrip("v"))
+    hints.discard("")
+    if not hints:
+        return "latest"
+    tags = {_norm(r.get("tag_name", "")).lstrip("v") for r in api(f"repos/{src.repo}/releases?per_page=100") or []}
+    return "stable" if hints & tags else "latest"
+
+
+def adopt(folder: Path, src: Source) -> dict:
+    if is_clone(folder):
+        return record(folder.name, src, "latest", "git", git("rev-parse", "HEAD", cwd=folder))
+    version = next((h["version"] for h in mod_headers(folder) if isinstance(h.get("version"), str)), "")
+    return record(folder.name, src, guess_channel(folder, src), "manual", version)
+
+
+def scan(tidy: bool) -> None:
+    """Take over mods installed by hand, so they're listed and updated like the rest.
+    With `tidy`, also delete second copies of a mod balala already manages (Steamodded
+    can't load two)."""
+    known = {k.lower() for k in STATE["mods"]}
+    folders = sorted(
+        (d for d in mod_folders() if d.name.lower() not in known), key=lambda d: (not is_clone(d), d.name.lower())
+    )
+    misses = STATE.setdefault("unknown", {})  # folder -> when balala last failed to place it
+    for gone in set(misses) - {d.name for d in folders}:
+        del misses[gone]
+    managed = {norm_remote(r["source"]): k for k, r in STATE["mods"].items()}
+    groups: dict[str, list[tuple[Path, Source]]] = {}
+    for d in folders:
+        if time.time() - misses.get(d.name, 0) < 86400:
+            continue
+        try:
+            src = identify(d)
+        except Fail:
+            continue  # offline, say: try again next time
+        if src is None:
+            misses[d.name] = time.time()
+            continue
+        misses.pop(d.name, None)
+        groups.setdefault(norm_remote(src.url), []).append((d, src))
+    lines = []
+    for key, found in groups.items():
+        if key not in managed:  # keep the clone, else the folder named like the repo, else the shortest name
+            d, src = min(
+                found,
+                key=lambda f: (
+                    not is_clone(f[0]),
+                    _folder_stem(f[0].name).lower() != f[1].name.lower(),
+                    len(f[0].name),
+                    f[0].name.lower(),
+                ),
+            )
+            found.remove((d, src))
+            managed[key] = d.name
+            rec = adopt(d, src)
+            lines.append((paint("+", "1;32"), d.name, f"found {describe(rec)} from {display_source(src.url)}"))
+        for d, _ in found:
+            _dupes[d.name] = managed[key]
+            if tidy:
+                delete(d)
+                lines.append((paint("−", "1;31"), d.name, f"deleted: a second copy of {managed[key]}"))
+    save_state()
+    width = max((len(n) for _, n, _ in lines), default=0)
+    for glyph, n, text in lines:
+        print(f"  {glyph} {n:<{width}}  {text}")
 
 
 # ── lovely ────────────────────────────────────────────────────────────────
@@ -1199,46 +1418,75 @@ def _mod_job(name: str, channel: str | None) -> Callable[[], Result]:
     return job
 
 
-def cmd_setup(channel: str | None) -> int:
-    failed = run_jobs([("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in CORE)])
+def cmd_setup(channel: str | None, width: int = 0) -> int:
+    jobs = [("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in map(core_name, CORE))]
+    failed = run_jobs(jobs, width)
     if not failed:
         STATE["setup"] = now()  # from now on, a core mod you remove stays removed
         save_state()
     return failed
 
 
+def resolve(link: str) -> tuple[Source, bool]:
+    """A link, or a bare mod name like "Cryptid"; returns (source, whether it was found by name)."""
+    try:
+        return parse_source(link), False
+    except Fail:
+        if not re.fullmatch(r"[\w .'+-]+", link.strip()):
+            raise
+    src = find_by_name(link.strip())
+    if src is None:
+        die(f"couldn't find a mod called {link.strip()!r}; give its GitHub link")
+    return src, True
+
+
 def cmd_install(links: list[str], channel: str, name: str | None) -> int:
     if name and len(links) > 1:
         die("--name only works with one link")
-    sources = [parse_source(link) for link in links]  # bad links fail before anything changes
-    failed = run_jobs([(name or s.name, lambda s=s: ensure_mod(s, channel, name)) for s in sources])
-    for s in sources:
-        if (name or s.name) in STATE["mods"]:
-            for w in missing_deps(name or s.name):
+    picks = []
+    for link in links:  # bad links fail before anything changes
+        src, by_name = resolve(link)
+        picks.append((canonical_name(name or key_for(src) or src.name), src, by_name))
+
+    def install(n: str, src: Source, by_name: bool) -> Result:
+        if by_name:
+            note(f"from {display_source(src.url)}")
+        return ensure_mod(src, channel, n)
+
+    failed = run_jobs([(n, lambda p=(n, s, b): install(*p)) for n, s, b in picks])
+    for n, _, _ in picks:
+        if n in STATE["mods"]:
+            for w in missing_deps(n):
                 warn(w)
     return failed
 
 
 def cmd_update(channel: str | None) -> int:
     if not STATE.get("setup"):  # never set up: setting up is the update
-        failed = cmd_setup(channel)
-        rest = [n for n in STATE["mods"] if n not in CORE]
-        return failed + (run_jobs([(n, _mod_job(n, channel)) for n in rest]) if rest else 0)
-    names = [*(n for n in CORE if n in STATE["mods"]), *(n for n in STATE["mods"] if n not in CORE)]
+        rest = [n for n in STATE["mods"] if not is_core(n)]
+        width = max(len(n) for n in ["lovely", *map(core_name, CORE), *rest])  # one column for both parts
+        failed = cmd_setup(channel, width)
+        return failed + (run_jobs([(n, _mod_job(n, channel)) for n in rest], width) if rest else 0)
+    core = [n for n in map(core_name, CORE) if n in STATE["mods"]]
+    names = [*core, *(n for n in STATE["mods"] if n not in core)]
     return run_jobs([("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in names)])
 
 
 def cmd_list() -> int:
     rows = [("lovely", "release", describe(STATE.get("lovely")) or "not installed", LOVELY_REPO)]
-    for n in [*CORE, *sorted((k for k in STATE["mods"] if k not in CORE), key=str.lower)]:
+    core = {n: core_name(n) for n in CORE}
+    others = sorted((k for k in STATE["mods"] if k not in core.values()), key=str.lower)
+    for n in [*core.values(), *others]:
         rec = STATE["mods"].get(n)
         if rec is None:
             rows.append((n, "", "not installed", CORE[n]))
             continue
         version = describe(rec) + ("" if (ENV.mods / n).is_dir() else " (folder missing)")
         rows.append((n, rec["channel"] if rec["kind"] != "archive" else "file", version, display_source(rec["source"])))
-    managed = set(STATE["mods"])
-    rows += [(d.name, "", "not managed by balala", "") for d in mod_folders() if d.name not in managed]
+    for d in mod_folders():
+        if d.name not in STATE["mods"]:
+            what = f"a second copy of {_dupes[d.name]}" if d.name in _dupes else "not managed: source unknown"
+            rows.append((d.name, "", what, ""))
     header = ("NAME", "CHANNEL", "VERSION", "SOURCE")
     widths = [max(len(r[i]) for r in [header, *rows]) for i in range(3)]
 
@@ -1260,12 +1508,11 @@ def cmd_remove(queries: list[str]) -> int:
         hits.append(hit or die(f"{q} isn't installed (see `balala list`)"))
 
     def remove(name: str) -> Result:
-        target = ENV.mods / name
-        if target.exists() or target.is_symlink():
-            clear_target(target, STATE["mods"].get(name))
+        core = is_core(name)
+        delete(ENV.mods / name)
         STATE["mods"].pop(name, None)
         save_state()
-        if name in CORE:
+        if core:
             note("part of setup; `balala setup` brings it back")
         return Result("removed")
 
@@ -1325,6 +1572,7 @@ def cmd_launch() -> int:
     game = ENV.game
     if not STATE.get("setup"):
         print("First run: setting up lovely, Steamodded and Amulet.")
+        scan(tidy=True)
         if cmd_setup(None):
             die("setup didn't finish, so Balatro wasn't launched")
     elif not lovely_present() and run_jobs([("lovely", ensure_lovely)]):
@@ -1359,8 +1607,8 @@ channels (setup, install, update):
 
 examples:
   balala                                  launch
-  balala install SpectralPack/Cryptid     install a mod from GitHub
-  balala install <url> --stable           ...at its newest release
+  balala install Cryptid                  install a mod by name
+  balala install SpectralPack/Cryptid -s  ...or by repo, at its newest release
   balala update                           update everything
   balala logs -f                          watch the game's log
 """
@@ -1403,19 +1651,19 @@ def build_parser() -> argparse.ArgumentParser:
     channels(sp, True)
     sp = sub.add_parser(
         "install",
-        help="install mods from GitHub, git or .zip links",
-        description="Install mods. A link can be a GitHub repo (owner/repo, a URL, or a "
-        ".../tree/<branch> URL), any git URL, a .zip/.tar.gz URL, or a local "
-        "archive or git checkout. Installing an installed mod updates it.",
+        help="install mods by name or link",
+        description="Install mods. Give a mod's name (looked up on Thunderstore, then GitHub), "
+        "a GitHub repo (owner/repo, a URL, or a .../tree/<branch> URL), any git URL, a .zip/.tar.gz URL, "
+        "or a local archive or git checkout. Installing an installed mod updates it.",
     )
-    sp.add_argument("links", nargs="+", metavar="LINK")
+    sp.add_argument("links", nargs="+", metavar="MOD")
     sp.add_argument("-n", "--name", help="folder name in Mods/ (default: the repo's name)")
     channels(sp, True)
     sp = sub.add_parser(
         "update",
         help="update lovely, Steamodded, Amulet and your mods",
-        description="Update everything balala installed. Each mod stays on its channel "
-        "unless you pass -l or -s, which moves them all.",
+        description="Update lovely, Steamodded, Amulet and every mod, including ones installed by hand. "
+        "Each mod stays on its channel unless you pass -l or -s, which moves them all.",
     )
     channels(sp, False)
     sub.add_parser("list", help="show what's installed", description="Show what's installed.")
@@ -1440,10 +1688,12 @@ def main(argv: list[str] | None = None) -> int:
         cmd = args.cmd or "launch"
         if cmd == "launch":
             return cmd_launch()
-        if cmd == "list":
-            return cmd_list()
         if cmd == "logs":
             return cmd_logs(args.follow, args.lines)
+        if cmd in ("list", "setup", "install", "update"):
+            scan(tidy=cmd != "list")  # take over mods installed by hand
+        if cmd == "list":
+            return cmd_list()
         if cmd == "setup":
             failed = cmd_setup(args.channel or "latest")
         elif cmd == "install":
@@ -1452,6 +1702,8 @@ def main(argv: list[str] | None = None) -> int:
             failed = cmd_update(args.channel)
         else:
             failed = cmd_remove(args.names)
+        for w in conflicts():
+            warn(w)
         if game_running():
             print(paint("Balatro is running; changes apply the next time it starts.", "2"))
         return 1 if failed else 0

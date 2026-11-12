@@ -41,8 +41,15 @@ def sandbox(tmp_path, monkeypatch, request):
         monkeypatch.setenv(k, str(v))
     monkeypatch.delenv("BALALA_STEAM_DIR", raising=False)
     monkeypatch.setattr(balala, "game_running", lambda: False)
-    if "network" not in request.keywords:  # offline tests never fetch lovely
+    monkeypatch.setattr(balala, "_catalog", None)
+    monkeypatch.setattr(balala, "_repo_ids", {})
+    monkeypatch.setattr(balala, "_dupes", {})
+    if "network" not in request.keywords:  # offline tests never touch GitHub
         monkeypatch.setattr(balala, "ensure_lovely", lambda: balala.Result("current", "v0.0.0"))
+        monkeypatch.setattr(balala, "catalog", lambda: [])
+        monkeypatch.setattr(balala, "search_github", lambda name: [])
+        monkeypatch.setattr(balala, "repo_ids", lambda repo: set())
+        monkeypatch.setattr(balala, "guess_channel", lambda folder, src: "latest")
     launches = []
     monkeypatch.setattr(type(PLATFORM), "launch", lambda self, g: launches.append(g))
     return SimpleNamespace(root=tmp_path, game=game, mods=tmp_path / "Mods", data=tmp_path / "data", launches=launches)
@@ -64,6 +71,12 @@ def seed_setup(sb) -> None:
     (sb.data / "state.json").write_text(
         json.dumps({"setup": "x", "lovely": {"ref": "v0.0.0", "files": PLATFORM.lovely_default_files()}, "mods": {}})
     )
+
+
+def init_globals() -> None:
+    """Set up balala's ENV and STATE so tests can call its internals."""
+    balala.ENV = balala.Env()
+    balala.STATE = balala.load_state()
 
 
 class Upstream:
@@ -102,10 +115,20 @@ def head_of(clone: Path) -> tuple[str, str]:
     return sh("rev-parse", "--abbrev-ref", "HEAD", cwd=clone), sh("log", "-1", "--format=%s", cwd=clone)
 
 
-def init_globals() -> None:
-    """Set up balala's ENV and STATE so tests can call its internals."""
-    balala.ENV = balala.Env()
-    balala.STATE = balala.load_state()
+def make_zip(path: Path, files: dict[str, str]) -> Path:
+    with zipfile.ZipFile(path, "w") as z:
+        for name, body in files.items():
+            z.writestr(name, body)
+    return path
+
+
+def hand_install(mods: Path, folder: str, header: dict) -> Path:
+    """A mod unzipped into Mods/ by hand: no .git, no record in balala's state."""
+    d = mods / folder
+    d.mkdir(parents=True)
+    (d / "mod.json").write_text(json.dumps({"main_file": "main.lua", **header}))
+    (d / "main.lua").write_text("")
+    return d
 
 
 # ── parsing ───────────────────────────────────────────────────────────────
@@ -156,9 +179,7 @@ def test_parse_source_rejects(link):
 
 
 def test_parse_source_local(tmp_path):
-    archive = tmp_path / "Thing.zip"
-    with zipfile.ZipFile(archive, "w") as z:
-        z.writestr("thing.lua", "")
+    archive = make_zip(tmp_path / "Thing.zip", {"thing.lua": ""})
     src = balala.parse_source(str(archive))
     assert (src.kind, src.name) == ("archive", "Thing")
     assert src.url.startswith("file://")
@@ -193,6 +214,14 @@ def test_transition():
     assert balala.transition("main@aaaaaaa", "main@bbbbbbb") == "main@aaaaaaa → bbbbbbb"
     assert balala.transition("v1", "main@bbbbbbb") == "v1 → main@bbbbbbb"
     assert balala.transition("", "v2") == "v2"
+
+
+@pytest.mark.parametrize(
+    "folder, stem",
+    [("Cryptid-main", "Cryptid"), ("Cryptid-0.5.17d", "Cryptid"), ("smods-1.0.0~BETA-0827c", "smods"), ("Foo", "Foo")],
+)
+def test_folder_stem(folder, stem):
+    assert balala._folder_stem(folder) == stem
 
 
 # ── Steam ─────────────────────────────────────────────────────────────────
@@ -279,29 +308,19 @@ def test_linux_prefix_and_launch_options(tmp_path, monkeypatch):
     pfx = lib / "steamapps/compatdata/2379780/pfx"
     pfx.mkdir(parents=True)
     assert linux.mods_dir(env) == pfx / "drive_c/users/steamuser/AppData/Roaming/Balatro/Mods"
-
-    steam = tmp_path / "Steam"
-    monkeypatch.setenv("BALALA_STEAM_DIR", str(steam))
+    monkeypatch.setenv("BALALA_STEAM_DIR", str(tmp_path / "Steam"))
     (hint,) = linux.hints(env.game, ["winmm.dll"])
     assert 'WINEDLLOVERRIDES="winmm=n,b" %command%' in hint
-    cfg = steam / "userdata/123/config/localconfig.vdf"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text(
-        '"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "apps" { "2379780" '
-        '{ "LaunchOptions" "WINEDLLOVERRIDES=\\"winmm=n,b\\" %command%" } } } } } }'
-    )
-    assert linux.hints(env.game, ["winmm.dll"]) == []
 
 
 # ── mods from git ─────────────────────────────────────────────────────────
 
 
-def test_git_install_update_and_local_work(sandbox, tmp_path, capsys):
+def test_git_install_and_update(sandbox, tmp_path, capsys):
     seed_setup(sandbox)
     up = Upstream(tmp_path)
     assert run("install", up.url, "-n", "toy") == 0
     clone = sandbox.mods / "toy"
-    assert (clone / "toy.json").is_file()
     assert state(sandbox)["mods"]["toy"]["kind"] == "git"
 
     up.commit("v2")
@@ -309,54 +328,24 @@ def test_git_install_update_and_local_work(sandbox, tmp_path, capsys):
     assert run("update") == 0
     assert (clone / "toy.lua").read_text() == "v2"
 
-    up.commit("v2b", amend=True)  # upstream rewrites history; the clone is untouched, so follow it
+    sh("commit", "-q", "--allow-empty", "-m", "mine", cwd=clone)  # a local commit...
+    up.commit("v2b", amend=True)  # ...and upstream rewrites its history
     up.push(force=True)
     capsys.readouterr()
     assert run("update") == 0
-    assert "rewrote its history" in capsys.readouterr().out
-    assert (clone / "toy.lua").read_text() == "v2b"
+    assert "reset to match" in capsys.readouterr().out
+    assert head_of(clone) == ("main", "v2b")
 
-    (clone / "toy.lua").write_text("my edit")  # local work is never discarded
+    (clone / "toy.lua").write_text("my edit")  # uncommitted edits are the one thing update leaves alone
     up.commit("v3")
     up.push()
     assert run("update") == 0
-    assert "local changes" in capsys.readouterr().out
+    assert "uncommitted changes" in capsys.readouterr().out
     assert (clone / "toy.lua").read_text() == "my edit"
 
-    assert run("remove", "toy") == 0  # ...not even by remove: it goes to backups
+    assert run("remove", "TOY") == 0  # names match case-insensitively
     assert not clone.exists()
-    (backup,) = (sandbox.data / "backups").iterdir()
-    assert (backup / "toy.lua").read_text() == "my edit"
-
-
-def test_kept_local_commit_survives_later_updates(sandbox, tmp_path, capsys):
-    seed_setup(sandbox)
-    up = Upstream(tmp_path)
-    run("install", up.url, "-n", "toy")
-    clone = sandbox.mods / "toy"
-    sh("commit", "-q", "--allow-empty", "-m", "mine", cwd=clone)
-    up.commit("v1b", amend=True)  # upstream diverges from the local commit
-    up.push(force=True)
-    for _ in range(2):  # the second update must not take the kept commit for balala's own
-        assert run("update") == 0
-        assert "local changes or commits" in capsys.readouterr().out
-        assert head_of(clone)[1] == "mine"
-    assert run("remove", "toy") == 0
-    (backup,) = (sandbox.data / "backups").iterdir()
-    assert head_of(backup)[1] == "mine"
-
-
-@pytest.mark.parametrize("ignored", [False, True])
-def test_untracked_and_ignored_files_are_preserved(sandbox, tmp_path, ignored):
-    up = Upstream(tmp_path)
-    run("install", up.url, "-n", "toy")
-    clone = sandbox.mods / "toy"
-    if ignored:
-        (clone / ".git/info/exclude").write_text("settings.lua\n")
-    (clone / "settings.lua").write_text("mine")
-    assert run("remove", "toy") == 0
-    (backup,) = (sandbox.data / "backups").iterdir()
-    assert (backup / "settings.lua").read_text() == "mine"
+    assert "toy" not in state(sandbox)["mods"]
 
 
 def test_branch_link_and_back(sandbox, tmp_path):
@@ -367,7 +356,6 @@ def test_branch_link_and_back(sandbox, tmp_path):
     assert head_of(sandbox.mods / "toy") == ("dev", "dev")
     balala.ensure_mod(balala.Source(up.url, "git", "toy"), "latest")  # asking for the default branch switches back
     assert head_of(sandbox.mods / "toy") == ("main", "v1")
-    assert not (sandbox.data / "backups").exists()  # the dev clone was balala's and untouched
 
 
 def test_case_variant_names_share_one_record(sandbox, tmp_path):
@@ -375,15 +363,6 @@ def test_case_variant_names_share_one_record(sandbox, tmp_path):
     run("install", up.url, "-n", "toy")
     run("install", up.url, "-n", "TOY")
     assert list(state(sandbox)["mods"]) == ["toy"]
-
-
-def test_remove_clean_clone_deletes_it(sandbox, tmp_path):
-    up = Upstream(tmp_path)
-    run("install", up.url, "-n", "toy")
-    assert run("remove", "TOY") == 0  # names match case-insensitively
-    assert not (sandbox.mods / "toy").exists()
-    assert not (sandbox.data / "backups").exists()
-    assert "toy" not in state(sandbox)["mods"]
 
 
 def test_update_keeps_each_mods_channel(sandbox, tmp_path, monkeypatch):
@@ -439,14 +418,7 @@ def test_filesystem_errors_fail_one_job_not_the_run(sandbox, monkeypatch, capsys
     assert seen == ["one", "two"]
 
 
-# ── mods from archives, folders and headers ───────────────────────────────
-
-
-def make_zip(path: Path, files: dict[str, str]) -> Path:
-    with zipfile.ZipFile(path, "w") as z:
-        for name, body in files.items():
-            z.writestr(name, body)
-    return path
+# ── mods from archives ────────────────────────────────────────────────────
 
 
 def test_archive_install_and_update(sandbox, tmp_path, capsys):
@@ -461,17 +433,6 @@ def test_archive_install_and_update(sandbox, tmp_path, capsys):
     assert (sandbox.mods / "Thing/thing.lua").read_text() == "v2"
 
 
-def test_edited_archive_install_is_backed_up(sandbox, tmp_path):
-    archive = make_zip(tmp_path / "Thing.zip", {"thing.lua": "v1"})
-    run("install", str(archive))
-    (sandbox.mods / "Thing/thing.lua").write_text("my tweak")
-    make_zip(archive, {"thing.lua": "v2"})
-    assert run("install", str(archive)) == 0
-    assert (sandbox.mods / "Thing/thing.lua").read_text() == "v2"
-    (backup,) = (sandbox.data / "backups").iterdir()
-    assert (backup / "thing.lua").read_text() == "my tweak"
-
-
 def test_same_archive_from_a_new_link_updates_the_source(sandbox, tmp_path):
     old = make_zip(tmp_path / "old.zip", {"thing.lua": "v1"})
     new = tmp_path / "new.zip"
@@ -481,16 +442,135 @@ def test_same_archive_from_a_new_link_updates_the_source(sandbox, tmp_path):
     assert state(sandbox)["mods"]["Thing"]["source"] == new.resolve().as_uri()
 
 
-def test_unmanaged_folder_is_listed_and_backed_up(sandbox, capsys):
-    hand = sandbox.mods / "HandMade"
-    hand.mkdir(parents=True)
-    (hand / "main.lua").write_text("mine")
+@pytest.mark.parametrize("name", ["lovely", ".hidden", "a/b", ".."])
+def test_bad_folder_names(sandbox, tmp_path, name):
+    up = Upstream(tmp_path)
+    assert run("install", up.url, "-n", name) == 1
+
+
+# ── mods installed by hand ────────────────────────────────────────────────
+
+
+def test_hand_made_clone_is_adopted_and_updated(sandbox, tmp_path, capsys):
     seed_setup(sandbox)
+    up = Upstream(tmp_path)
+    sandbox.mods.mkdir()
+    sh("clone", "-q", up.url, str(sandbox.mods / "Toy"))
+    assert run("list") == 0
+    out = capsys.readouterr().out
+    assert "found main@" in out
+    rec = state(sandbox)["mods"]["Toy"]
+    assert (rec["kind"], rec["channel"]) == ("git", "latest")
+    up.commit("v2")
+    up.push()
+    assert run("update") == 0
+    assert (sandbox.mods / "Toy/toy.lua").read_text() == "v2"
+
+
+def test_hand_install_found_on_thunderstore_is_replaced_on_update(sandbox, tmp_path, monkeypatch, capsys):
+    seed_setup(sandbox)
+    up = Upstream(tmp_path, {"id": "Thing", "main_file": "toy.lua"})
+    hand_install(sandbox.mods, "Thing-main", {"id": "Thing", "version": "1.0"})
+    monkeypatch.setattr(balala, "catalog", lambda: [{"name": "Thing", "repo": up.url}])
+    monkeypatch.setattr(balala, "_verified", lambda url, ids: balala.parse_source(url) if "thing" in ids else None)
+    assert run("list") == 0
+    assert "Thing-main  latest   1.0 (by hand)" in capsys.readouterr().out
+    assert run("update") == 0  # superseded by a real install from its source
+    rec = state(sandbox)["mods"]["Thing-main"]
+    assert rec["kind"] == "git"
+    assert head_of(sandbox.mods / "Thing-main") == ("main", "v1")
+
+
+def test_hand_install_found_through_its_own_manifest(sandbox, monkeypatch):
+    seed_setup(sandbox)
+    d = hand_install(sandbox.mods, "Gem", {"id": "Gem"})
+    (d / "manifest.json").write_text(json.dumps({"name": "Gem", "website_url": "https://github.com/someone/gem-mod"}))
+    monkeypatch.setattr(balala, "repo_ids", lambda repo: {"gem"} if repo == "someone/gem-mod" else set())
     run("list")
-    assert "not managed by balala" in capsys.readouterr().out
-    assert run("remove", "handmade") == 0
-    (backup,) = (sandbox.data / "backups").iterdir()
-    assert (backup / "main.lua").read_text() == "mine"
+    assert state(sandbox)["mods"]["Gem"]["source"] == "https://github.com/someone/gem-mod"
+
+
+def test_namesake_is_not_adopted(sandbox, monkeypatch, capsys):
+    seed_setup(sandbox)
+    hand_install(sandbox.mods, "Thing", {"id": "Thing"})
+    monkeypatch.setattr(balala, "catalog", lambda: [{"name": "Thing", "repo": "https://github.com/someone/Thing"}])
+    monkeypatch.setattr(balala, "repo_ids", lambda repo: {"otherthing"})  # same name, different mod
+    run("list")
+    assert "not managed: source unknown" in capsys.readouterr().out
+    assert "Thing" not in state(sandbox)["mods"]
+
+
+def test_folder_without_a_header_is_left_alone(sandbox, monkeypatch):
+    seed_setup(sandbox)
+    (sandbox.mods / "Jokers").mkdir(parents=True)  # a lovely-only mod: nothing to check a match against
+    (sandbox.mods / "Jokers/lovely.toml").write_text("")
+    monkeypatch.setattr(balala, "catalog", lambda: [{"name": "Jokers", "repo": "https://github.com/a/Jokers"}])
+    run("list")
+    assert state(sandbox)["mods"] == {}
+
+
+def test_hand_installed_steamodded_counts_as_core(sandbox, capsys):
+    seed_setup(sandbox)
+    smods = sandbox.mods / "Steamodded-main"
+    for p in ("src", "lovely"):
+        (smods / p).mkdir(parents=True)
+    (smods / "version.lua").write_text("")
+    init_globals()
+    balala.scan(tidy=False)
+    assert balala.core_name("smods") == "Steamodded-main"
+    capsys.readouterr()
+    balala.cmd_list()
+    out = capsys.readouterr().out
+    assert "Steamodded-main" in out and "smods " not in out
+
+
+def test_second_copy_is_deleted(sandbox, tmp_path, capsys):
+    seed_setup(sandbox)
+    up = Upstream(tmp_path)
+    run("install", up.url, "-n", "Toy")
+    sh("clone", "-q", up.url, str(sandbox.mods / "Toy-copy"))
+    capsys.readouterr()
+    run("list")
+    assert "a second copy of Toy" in capsys.readouterr().out
+    assert run("update") == 0
+    assert "deleted: a second copy of Toy" in capsys.readouterr().out
+    assert not (sandbox.mods / "Toy-copy").exists()
+
+
+def test_install_by_name(sandbox, tmp_path, monkeypatch, capsys):
+    up = Upstream(tmp_path)
+    monkeypatch.setattr(balala, "catalog", lambda: [{"name": "ToyMod", "repo": up.url}])
+    monkeypatch.setattr(balala, "_verified", lambda url, ids: balala.parse_source(url) if "toymod" in ids else None)
+    assert run("install", "Toy Mod") == 0
+    out = capsys.readouterr().out
+    assert "from " in out
+    assert state(sandbox)["mods"]["upstream"]["source"] == up.url
+    assert run("install", "nothing-like-this") == 1
+
+
+def test_conflicts(sandbox):
+    hand_install(sandbox.mods, "Amulet", {"id": "Amulet", "provides": ["Talisman"]})
+    hand_install(sandbox.mods, "Talisman", {"id": "Talisman"})
+    hand_install(sandbox.mods, "Foo", {"id": "Foo"})
+    hand_install(sandbox.mods, "Foo-main", {"id": "Foo"})
+    init_globals()
+    assert sorted(balala.conflicts()) == [
+        "Amulet replaces Talisman; remove it",
+        "Foo is installed twice (Foo and Foo-main); remove one",
+    ]
+
+
+def test_guess_channel(tmp_path, monkeypatch):
+    guess = balala.__dict__["guess_channel"]
+    monkeypatch.setattr(balala, "api", lambda path: [{"tag_name": "v1.2.0"}])
+    src = balala.parse_source("o/Thing")
+    for folder, header, expected in [
+        ("Thing-1.2.0", {}, "stable"),
+        ("Thing", {"version": "1.2.0"}, "stable"),
+        ("Thing-main", {"version": "1.3.0-dev"}, "latest"),
+    ]:
+        d = hand_install(tmp_path, folder, {"id": "Thing", **header})
+        assert guess(d, src) == expected, folder
 
 
 def test_dependency_warnings(sandbox, tmp_path, capsys):
@@ -499,16 +579,19 @@ def test_dependency_warnings(sandbox, tmp_path, capsys):
     run("install", up.url, "-n", "toy")
     err = capsys.readouterr().err
     assert "Talisman | Other" in err and "Steamodded (>=1.0)" in err
-    provider = sandbox.mods / "amulet"
-    provider.mkdir()
-    (provider / "smods.json").write_text(json.dumps({"id": "Amulet", "main_file": "x.lua", "provides": ["Talisman"]}))
+    hand_install(sandbox.mods, "amulet", {"id": "Amulet", "provides": ["Talisman"]})
     assert balala.missing_deps("toy") == ["Toy needs Steamodded (>=1.0), which isn't installed"]
 
 
-@pytest.mark.parametrize("name", ["lovely", ".hidden", "a/b", ".."])
-def test_bad_folder_names(sandbox, tmp_path, name):
-    up = Upstream(tmp_path)
-    assert run("install", up.url, "-n", name) == 1
+def test_unknown_folder_is_listed_and_removable(sandbox, capsys):
+    seed_setup(sandbox)
+    hand = sandbox.mods / "HandMade"
+    hand.mkdir(parents=True)
+    (hand / "main.lua").write_text("mine")
+    run("list")
+    assert "not managed: source unknown" in capsys.readouterr().out
+    assert run("remove", "handmade") == 0
+    assert not hand.exists()
 
 
 # ── launch and logs ───────────────────────────────────────────────────────
@@ -561,7 +644,48 @@ def test_setup_install_update_against_github(sandbox, capsys):
 
     assert run("update", "--latest") == 0
     assert state(sandbox)["mods"]["smods"]["kind"] == "git"
+
+
+def unzip_from(url: str, mods: Path, tmp: Path) -> None:
+    archive = tmp / "dl.zip"
+    balala.download(url, archive)
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(mods)
+
+
+@pytest.mark.network
+def test_hand_installs_are_taken_over(sandbox, tmp_path, capsys):
+    """The way people install by hand: GitHub's 'Download ZIP' or a release zip, unzipped into Mods/."""
+    sandbox.mods.mkdir()
+    init_globals()
+    unzip_from("https://codeload.github.com/SpectralPack/Cryptid/zip/refs/tags/v0.5.17d", sandbox.mods, tmp_path)
+    unzip_from("https://codeload.github.com/Steamodded/smods/zip/refs/tags/26.1002.0", sandbox.mods, tmp_path)
+    (sandbox.mods / "Amulet").mkdir()
+    unzip_from(
+        "https://github.com/frostice482/amulet/releases/download/3.6.1/Amulet.zip", sandbox.mods / "Amulet", tmp_path
+    )
+    assert sorted(d.name for d in sandbox.mods.iterdir()) == ["Amulet", "Cryptid-0.5.17d", "smods-26.1002.0"]
+
     assert run("list") == 0
+    st = state(sandbox)["mods"]
+    assert st["Cryptid-0.5.17d"]["source"] == "https://github.com/SpectralPack/Cryptid"  # via Thunderstore
+    assert st["Amulet"]["source"] == "https://github.com/frostice482/amulet"  # via its manifest.json
+    assert st["smods-26.1002.0"]["source"] == "https://github.com/Steamodded/smods"  # by its layout
+    assert st["Cryptid-0.5.17d"]["channel"] == "stable"  # the folder names a release tag
+
+    assert run("update") == 0  # setup hasn't run, so this sets up too, reusing the hand installs
+    st = state(sandbox)["mods"]
+    assert sorted(st) == ["Amulet", "Cryptid-0.5.17d", "smods-26.1002.0"]
+    assert all(r["kind"] in ("git", "release") for r in st.values())
+    assert sorted(d.name for d in sandbox.mods.iterdir()) == ["Amulet", "Cryptid-0.5.17d", "smods-26.1002.0"]
+
+
+@pytest.mark.network
+def test_install_by_name_against_github(sandbox):
+    assert run("install", "Cryptid", "Amulet") == 0  # GitHub search alone would pick another "amulet"
+    mods = state(sandbox)["mods"]
+    assert mods["Cryptid"]["source"] == "https://github.com/SpectralPack/Cryptid"
+    assert mods["amulet"]["source"] == "https://github.com/frostice482/amulet"
 
 
 @pytest.mark.network

@@ -49,14 +49,15 @@ balala is one file with no dependencies, so you can also download `balala.py` fr
 | --- | --- |
 | `balala` | Launch Balatro with your mods. The first time, this runs `setup`. |
 | `balala setup [-l\|-s]` | Install lovely, Steamodded and Amulet. |
-| `balala install LINK... [-l\|-s] [-n NAME]` | Install mods. Installing a mod that's already there updates it. |
-| `balala update [-l\|-s]` | Update lovely, Steamodded, Amulet and every mod balala installed. |
-| `balala list` | Show what's installed, and any mod folders balala doesn't manage. |
+| `balala install MOD... [-l\|-s] [-n NAME]` | Install mods by name or link. Installing a mod that's already there updates it. |
+| `balala update [-l\|-s]` | Update lovely, Steamodded, Amulet and every mod, including ones you installed by hand. |
+| `balala list` | Show what's installed. |
 | `balala remove NAME...` | Remove mods. |
 | `balala logs [-f] [-n N]` | Show the game's latest lovely log; `-f` follows it as the game runs. |
 
 `install` takes:
 
+- a mod's name, like `Cryptid`, looked up on [Thunderstore](https://thunderstore.io/c/balatro/) and GitHub;
 - a GitHub repo: `SpectralPack/Cryptid`, `https://github.com/SpectralPack/Cryptid`, or a branch link like
   `https://github.com/owner/repo/tree/dev`;
 - any other git URL, such as a GitLab or Codeberg repo;
@@ -64,7 +65,25 @@ balala is one file with no dependencies, so you can also download `balala.py` fr
 - a local archive or git checkout.
 
 Each mod gets its own folder in `Mods/`, named after the repo. `-n` picks another name. After an install, balala
-reads the mod's Steamodded metadata and warns about dependencies that aren't installed.
+reads the mod's Steamodded metadata and warns about dependencies that aren't installed. After any change, it warns
+about mods Steamodded won't load together: the same mod twice, or a mod next to one that replaces it, like Talisman
+next to Amulet.
+
+### Mods you installed by hand
+
+balala takes over mods that were already in your Mods folder, so `list` shows them and `update` keeps them current.
+It works out where each one came from:
+
+- a git clone, from its remote;
+- Steamodded, from its layout;
+- anything else, from the mod's own metadata (such as a Thunderstore manifest's link), Thunderstore's Balatro
+  catalog, or a GitHub search for the mod's id. A match counts only if that repo declares the same Steamodded id, so
+  a different mod with the same name is never mistaken for yours.
+
+A hand install that looks like a release (say, a `Cryptid-0.5.17d` folder) stays on releases; anything else tracks
+the newest commit. The next `update` replaces it with a fresh copy from its source. If you have two copies of one
+mod, which Steamodded won't load, balala keeps one and deletes the other. Folders it can't place, including mods
+with no Steamodded header, are listed and left alone.
 
 ### Channels
 
@@ -100,13 +119,9 @@ with real mods, but the launch step hasn't been run against the real game yet. R
 - Its own state, under `~/Library/Application Support/balala` on macOS, `%LocalAppData%\balala` on Windows, and
   `~/.local/share/balala` on Linux.
 
-It's careful with your work:
-
-- `update` only fast-forwards a git clone, and leaves any clone with uncommitted edits or local commits alone. If
-  upstream rewrites its history, a clone balala hasn't touched since it put it there is reset to match.
-- balala only deletes a mod folder it can prove is untouched: a clean clone with no new, ignored or committed
-  files of yours, or a release or archive install whose files still match what was unpacked. Anything else that has
-  to go, including any folder balala didn't install, is moved to a `backups` folder next to its state.
+A mod's folder belongs to balala: `update` makes it match its source, and `remove` deletes it. The one exception
+is a git clone with uncommitted edits, which `update` leaves alone. Local commits don't stop an update, but git
+keeps them in `git reflog` for a while.
 
 Remove Steamodded or Amulet and they stay removed (`balala setup` brings them back). lovely is the exception: the
 game can't load mods without it, so a launch reinstalls it if it's missing, after a Steam reinstall for example.
