@@ -1,82 +1,142 @@
 # balala
 
-Modded Balatro on macOS (Steam), in one command. `balala` installs
-[lovely](https://github.com/ethangreen-dev/lovely-injector),
-[Steamodded](https://github.com/Steamodded/smods) and
-[Amulet](https://github.com/frostice482/amulet), installs mods from a link,
-keeps them all updated, and launches the game through lovely.
+[![CI](https://github.com/a9lim/balala/actions/workflows/ci.yml/badge.svg)](https://github.com/a9lim/balala/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+![macOS | Windows | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 
-```sh
-balala                                            # launch (runs setup on first use)
-balala install https://github.com/SpectralPack/Cryptid
-balala update
+One command for modded [Balatro](https://store.steampowered.com/app/2379780/Balatro/).
+
+balala installs [lovely](https://github.com/ethangreen-dev/lovely-injector) and
+[Steamodded](https://github.com/Steamodded/smods), plus
+[Amulet](https://github.com/frostice482/amulet), the maintained Talisman successor that big mods such as
+Cryptid expect. It installs mods from a link, keeps everything updated, and launches the game.
+
+```console
+$ balala
+First run: setting up lovely, Steamodded and Amulet.
+  + lovely  v0.10.0
+  + smods   main@6916f1e
+  + amulet  main@9c952a2
+▶ Balatro is starting with lovely v0.10.0 and 2 mods. Logs: balala logs -f
+
+$ balala install SpectralPack/Cryptid
+  + Cryptid  main@cdb0ddc
+
+$ balala update
+  ✓ lovely   v0.10.0
+  ↑ smods    main@6916f1e → 1a2b3c4
+  ✓ amulet   main@9c952a2
+  ✓ Cryptid  main@cdb0ddc
 ```
 
 ## Install
 
-It's one stdlib-only Python file (any `python3` ≥ 3.9, plus `git`). Link it onto
-your PATH:
+You need Balatro from Steam, Python 3.9 or newer, and git.
 
 ```sh
-ln -sfn ~/Work/balala/balala ~/.local/bin/balala
+uv tool install git+https://github.com/a9lim/balala
+# or
+pipx install git+https://github.com/a9lim/balala
 ```
 
-## Commands
+balala is one file with no dependencies, so you can also download `balala.py` from the
+[latest release](https://github.com/a9lim/balala/releases/latest) and run `python3 balala.py`.
 
-| Command | What it does |
+## Usage
+
+| Command | |
 | --- | --- |
-| `balala` / `balala launch [-- args]` | Launch Balatro with lovely via the stock `run_lovely_macos.sh`. Runs `setup` first if it never has. |
-| `balala setup [-s\|-l]` | Install lovely, Steamodded and Amulet. |
-| `balala install URL... [-s\|-l] [-n NAME]` | Install mods. Takes a GitHub repo (`https://github.com/o/r`, `github.com/o/r`, `o/r`, or `…/tree/branch`), any git URL, or a direct `.zip`/`.tar.gz` link. Re-running it on an installed mod updates it or switches its channel. |
-| `balala update [-s\|-l]` | Update lovely, Steamodded, Amulet and every mod balala installed. |
-| `balala list` | Show what's installed: channel, version or commit, source. Folders balala didn't install are listed as `unmanaged`. |
+| `balala` | Launch Balatro with your mods. The first time, this runs `setup`. |
+| `balala setup [-l\|-s]` | Install lovely, Steamodded and Amulet. |
+| `balala install LINK... [-l\|-s] [-n NAME]` | Install mods. Installing a mod that's already there updates it. |
+| `balala update [-l\|-s]` | Update lovely, Steamodded, Amulet and every mod balala installed. |
+| `balala list` | Show what's installed, and any mod folders balala doesn't manage. |
 | `balala remove NAME...` | Remove mods. |
+| `balala logs [-f] [-n N]` | Show the game's latest lovely log; `-f` follows it as the game runs. |
+
+`install` takes:
+
+- a GitHub repo: `SpectralPack/Cryptid`, `https://github.com/SpectralPack/Cryptid`, or a branch link like
+  `https://github.com/owner/repo/tree/dev`;
+- any other git URL, such as a GitLab or Codeberg repo;
+- a `.zip`/`.tar.gz` link, such as a release asset;
+- a local archive or git checkout.
+
+Each mod gets its own folder in `Mods/`, named after the repo. `-n` picks another name. After an install, balala
+reads the mod's Steamodded metadata and warns about dependencies that aren't installed.
 
 ### Channels
 
-- `-l` / `--latest` (the default) tracks HEAD of the default branch (or the
-  `/tree/` branch you linked) as a shallow git clone. `update` fast-forwards it.
-- `-s` / `--stable` installs the newest published release: the release's own
-  `.zip` asset if it has exactly one, otherwise the tag's source archive. A repo
-  with no releases falls back to HEAD, with a warning.
-- Anything that needs compiling is release-only, whatever the flag. Of the things
-  balala installs, only lovely (Rust) needs it.
+- **`-l` / `--latest`** (the default for `setup` and `install`) tracks the newest commit on the default branch,
+  or on the branch you linked, as a shallow git clone.
+- **`-s` / `--stable`** installs the newest published release: the release's zip if it has one, otherwise the
+  tag's source. A repo with no releases tracks its newest commit until it publishes one.
 
-The flag applies to everything a command touches. So plain `balala update`
-moves stable installs to HEAD, and `balala update -s` pins everything to
-releases.
+`balala update` keeps each mod on the channel it was installed with. `update -l` or `update -s` moves everything
+to that channel. lovely is compiled, so it always uses its newest release.
 
-## Where things go
+## Platforms
 
-| What | Where |
+| | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| **Game** | Steam | Steam | Steam, through Proton (including Steam Deck desktop mode) |
+| **lovely goes in** | the game folder: `liblovely.dylib` and `run_lovely_macos.sh` | the game folder: `winmm.dll` | the game folder: `winmm.dll` |
+| **Mods folder** | `~/Library/Application Support/Balatro/Mods` | `%AppData%\Balatro\Mods` | `…/steamapps/compatdata/2379780/pfx/drive_c/users/steamuser/AppData/Roaming/Balatro/Mods` |
+| **Launch** | lovely's script; Steam can't load lovely on macOS | through Steam | through Steam |
+
+balala finds the game through Steam's library list, including extra libraries on other drives.
+
+**Linux** needs one thing done by hand, because Steam doesn't let other programs change its settings. Set
+Balatro's launch options to `WINEDLLOVERRIDES="winmm=n,b" %command%`, and launch the game once from Steam before
+using balala so Proton creates its prefix. balala reminds you until the option is set.
+
+macOS has been tested end to end with the real game. On Windows and Linux, CI runs install, update and removal
+with real mods, but the launch step hasn't been run against the real game yet. Reports are welcome.
+
+## What it touches
+
+- lovely's files in the game folder, and your Mods folder. Nothing else in the game.
+- Its own state, under `~/Library/Application Support/balala` on macOS, `%LocalAppData%\balala` on Windows, and
+  `~/.local/share/balala` on Linux.
+
+It's careful with your work. `update` only fast-forwards a git clone, and leaves any clone with uncommitted edits or
+local commits alone. If upstream rewrites its history, a clone balala hasn't touched since it put it there is reset
+to match. When a folder that might hold your work has to go (a folder balala didn't install, or a clone with edits),
+balala moves it to a `backups` folder next to its state instead of deleting it.
+
+Remove Steamodded or Amulet and they stay removed (`balala setup` brings them back). lovely is the exception: the
+game can't load mods without it, so a launch reinstalls it if it's missing, after a Steam reinstall for example.
+
+## Configuration
+
+| Variable | |
 | --- | --- |
-| lovely (`liblovely.dylib`, `run_lovely_macos.sh`) | the game folder, found through Steam's `libraryfolders.vdf` |
-| mods | `~/Library/Application Support/Balatro/Mods/<repo name>` |
-| balala's record of what it installed | `~/Library/Application Support/balala/state.json` |
-| anything balala had to move out of the way | `~/Library/Application Support/balala/backups/` |
+| `BALALA_GAME_DIR` | the folder holding `Balatro.app` / `Balatro.exe`, if balala can't find it |
+| `BALALA_MODS_DIR` | the Mods folder |
+| `BALALA_STEAM_DIR` | your Steam folder, if it's somewhere unusual |
+| `BALALA_DATA_DIR` | where balala keeps its state |
+| `GITHUB_TOKEN` | raises GitHub's limit of 60 API requests an hour (`gh auth token` is used if you're logged in) |
+| `NO_COLOR` | turns off colors |
 
-Overrides: `BALALA_GAME_DIR` (the folder holding `Balatro.app`) and `BALALA_MODS_DIR`.
+The token is only ever sent to `api.github.com`.
 
-## Behavior worth knowing
+## Development
 
-- **Local work is never discarded.** `update` fast-forwards clones and leaves a
-  clone alone if it has uncommitted edits or local commits. When upstream rewrites
-  history, a clone balala hasn't touched since it put it there is reset to match.
-  Replacing a folder that might hold your work (an unmanaged folder, or a clone
-  with edits) moves it to `backups/` instead of deleting it.
-- **Removed core mods stay removed.** After the first setup, a bare `balala`
-  doesn't bring back a Steamodded or Amulet you removed (say, to try Talisman
-  instead). `balala setup` does. The one exception is lovely: the game can't
-  launch without it, so `balala` reinstalls it if it's missing (after a Steam
-  reinstall, say).
-- **Dependency hints.** After `install`, balala reads the mod's Steamodded
-  header and warns about any `dependencies` it can't find among installed mods,
-  counting what other mods `provide`. Amulet provides `Talisman`, for example.
-- **GitHub API.** balala uses `GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token` when
-  available. The token goes only to `api.github.com`, never to download hosts.
-  Without one you get GitHub's anonymous limit of 60 requests an hour.
+```sh
+uv run --group dev pytest                  # everything, including tests against GitHub
+uv run --group dev pytest -m "not network" # offline only
+uv run --group dev ruff check && uv run --group dev ruff format --check
+```
+
+To release, bump `__version__` in `balala.py`, add a `CHANGELOG.md` entry, and push a `vX.Y.Z` tag. CI builds the
+release.
 
 ## Credits
 
-Built by a9 and Claude. lovely, Steamodded and Amulet are their authors' work;
-balala only fetches them.
+Built by a9 and Claude.
+
+lovely, Steamodded and Amulet are their authors' work. balala downloads them, and every mod, from upstream and
+redistributes nothing. balala isn't affiliated with LocalThunk or Playstack.
+
+Licensed under the [GNU General Public License v3.0 or later](LICENSE).
