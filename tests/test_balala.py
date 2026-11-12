@@ -594,6 +594,60 @@ def test_unknown_folder_is_listed_and_removable(sandbox, capsys):
     assert not hand.exists()
 
 
+# ── updating balala itself ────────────────────────────────────────────────
+
+
+def test_upgrade_command(tmp_path):
+    def which(tool):
+        return f"/bin/{tool}"
+
+    uv_tool, pipx_env, venv = tmp_path / "uvtool", tmp_path / "pipxenv", tmp_path / "venv"
+    for d in (uv_tool, pipx_env, venv):
+        d.mkdir()
+    (uv_tool / "uv-receipt.toml").write_text("")
+    (pipx_env / "pipx_metadata.json").write_text("{}")
+    assert balala.upgrade_command(uv_tool, "uv", "S", which)[:4] == ["uv", "tool", "install", "--force"]
+    assert balala.upgrade_command(pipx_env, "pip", "S", which)[:3] == ["pipx", "install", "--force"]
+    assert balala.upgrade_command(venv, "uv", "S", which)[:3] == ["uv", "pip", "install"]
+    assert balala.upgrade_command(venv, "pip", "S", which)[1:4] == ["-m", "pip", "install"]
+    assert balala.upgrade_command(uv_tool, "uv", "S", lambda tool: None)[1:4] == ["-m", "pip", "install"]
+
+
+def fake_release(monkeypatch, tmp_path, version: str) -> Path:
+    new = tmp_path / "release" / "balala.py"
+    new.parent.mkdir()
+    new.write_text(f'__version__ = "{version}"\n')
+    rel = {"tag_name": f"v{version}", "assets": [{"name": "balala.py", "browser_download_url": new.as_uri()}]}
+    monkeypatch.setattr(balala, "newest_release", lambda repo: rel)
+    return new
+
+
+def test_single_file_updates_itself(tmp_path, monkeypatch):
+    copy = tmp_path / "bin" / "balala.py"
+    copy.parent.mkdir()
+    copy.write_text('__version__ = "0.0.1"\n')
+    monkeypatch.setattr(balala, "__file__", str(copy))
+    new = fake_release(monkeypatch, tmp_path, "99.0.0")
+    res = balala.ensure_self()
+    assert (res.status, res.detail) == ("updated", f"{balala.__version__} → 99.0.0")
+    assert copy.read_text() == new.read_text()
+
+
+def test_no_self_update_when_current_or_a_checkout(tmp_path, monkeypatch):
+    copy = tmp_path / "bin" / "balala.py"
+    copy.parent.mkdir()
+    copy.write_text("")
+    monkeypatch.setattr(balala, "__file__", str(copy))
+    fake_release(monkeypatch, tmp_path, balala.__version__)
+    assert balala.ensure_self().status == "current"
+    (copy.parent / ".git").mkdir()  # someone's checkout: theirs to update
+    (tmp_path / "newer").mkdir()
+    fake_release(monkeypatch, tmp_path / "newer", "99.0.0")
+    res = balala.ensure_self()
+    assert res.status == "current" and "git checkout" in res.detail
+    assert copy.read_text() == ""
+
+
 # ── launch and logs ───────────────────────────────────────────────────────
 
 
@@ -639,7 +693,7 @@ def test_setup_install_update_against_github(sandbox, capsys):
     capsys.readouterr()
     assert run("update") == 0  # nothing changed, and each mod kept its channel
     out = capsys.readouterr().out
-    assert out.count("✓") == 4, out
+    assert out.count("✓") == 5, out  # lovely, smods, amulet, Cryptid, and balala itself
     assert state(sandbox)["mods"]["smods"]["kind"] == "release"
 
     assert run("update", "--latest") == 0

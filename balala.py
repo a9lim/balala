@@ -32,7 +32,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 APP_ID = "2379780"  # Balatro's Steam app id
 LOVELY_REPO = "ethangreen-dev/lovely-injector"
@@ -1406,6 +1406,76 @@ def ensure_lovely() -> Result:
     return result
 
 
+# ── balala itself ─────────────────────────────────────────────────────────
+
+SELF_REPO = "a9lim/balala"
+
+
+def _version(s: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", s)[:3])
+
+
+def upgrade_command(prefix: Path, installer: str, spec: str, which=shutil.which) -> list[str]:
+    """The command that installs `spec` over this copy of balala, by the tool that installed it."""
+    if (prefix / "uv-receipt.toml").is_file() and which("uv"):  # a `uv tool` environment
+        return ["uv", "tool", "install", "--force", spec]
+    if (prefix / "pipx_metadata.json").is_file() and which("pipx"):
+        return ["pipx", "install", "--force", spec]
+    if installer == "uv" and which("uv"):
+        return ["uv", "pip", "install", "--reinstall", "--no-deps", "--python", sys.executable, spec]
+    return [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-deps", spec]
+
+
+def how_installed() -> tuple[str, dict | None]:
+    """("checkout" | "package" | "file", the package's metadata when it's a package)."""
+    here = Path(__file__).resolve()
+    if (here.parent / ".git").exists():
+        return "checkout", None
+    try:
+        from importlib import metadata
+
+        dist = metadata.distribution("balala")
+        if any(Path(str(dist.locate_file(f))).resolve() == here for f in dist.files or [] if f.name == "balala.py"):
+            direct = json.loads(dist.read_text("direct_url.json") or "null")
+            return "package", {"installer": (dist.read_text("INSTALLER") or "").strip(), "direct": direct}
+    except Exception:
+        pass
+    return "file", None
+
+
+def ensure_self() -> Result:
+    """Update balala to its newest release, the way it was installed. (Releases only: it's the tool
+    doing the updating, so it shouldn't track a commit that might be broken.)"""
+    kind, meta = how_installed()
+    if kind == "checkout":
+        return Result("current", f"{__version__} (a git checkout: update it with git)")
+    rel = newest_release(SELF_REPO)
+    if not rel or _version(rel["tag_name"]) <= _version(__version__):
+        return Result("current", __version__)
+    new = rel["tag_name"].lstrip("v")
+    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
+    if kind == "file":
+        url = assets.get("balala.py") or die(f"release {rel['tag_name']} has no balala.py")
+        here = Path(__file__).resolve()
+        part = here.with_name(f".{here.name}.balala-part")
+        download(url, part)
+        os.chmod(part, here.stat().st_mode)
+        os.replace(part, here)
+    else:
+        wheel = next((u for n, u in assets.items() if n.endswith(".whl")), None)
+        spec = f"balala=={new}" if not meta["direct"] or not wheel else f"balala @ {wheel}"  # PyPI, or the release
+        cmd = upgrade_command(Path(sys.prefix), meta["installer"], spec)
+        if os.name == "nt":  # Windows won't let the running balala.exe be replaced
+            note(f"to finish, run: {subprocess.list2cmdline(cmd)}")
+            return Result("kept", f"{__version__} → {new} available")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["?"]
+            die(f"{subprocess.list2cmdline(cmd)} failed: {tail[0]}")
+    note("takes effect the next time you run it")
+    return Result("updated", f"{__version__} → {new}")
+
+
 # ── commands ──────────────────────────────────────────────────────────────
 
 
@@ -1464,12 +1534,13 @@ def cmd_install(links: list[str], channel: str, name: str | None) -> int:
 def cmd_update(channel: str | None) -> int:
     if not STATE.get("setup"):  # never set up: setting up is the update
         rest = [n for n in STATE["mods"] if not is_core(n)]
-        width = max(len(n) for n in ["lovely", *map(core_name, CORE), *rest])  # one column for both parts
+        width = max(len(n) for n in ["lovely", "balala", *map(core_name, CORE), *rest])  # one column for both
         failed = cmd_setup(channel, width)
-        return failed + (run_jobs([(n, _mod_job(n, channel)) for n in rest], width) if rest else 0)
+        return failed + run_jobs([*((n, _mod_job(n, channel)) for n in rest), ("balala", ensure_self)], width)
     core = [n for n in map(core_name, CORE) if n in STATE["mods"]]
     names = [*core, *(n for n in STATE["mods"] if n not in core)]
-    return run_jobs([("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in names)])
+    jobs = [("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in names), ("balala", ensure_self)]
+    return run_jobs(jobs)
 
 
 def cmd_list() -> int:
@@ -1609,7 +1680,7 @@ examples:
   balala                                  launch
   balala install Cryptid                  install a mod by name
   balala install SpectralPack/Cryptid -s  ...or by repo, at its newest release
-  balala update                           update everything
+  balala update                           update everything, balala included
   balala logs -f                          watch the game's log
 """
 
@@ -1661,9 +1732,10 @@ def build_parser() -> argparse.ArgumentParser:
     channels(sp, True)
     sp = sub.add_parser(
         "update",
-        help="update lovely, Steamodded, Amulet and your mods",
-        description="Update lovely, Steamodded, Amulet and every mod, including ones installed by hand. "
-        "Each mod stays on its channel unless you pass -l or -s, which moves them all.",
+        help="update lovely, Steamodded, Amulet, your mods and balala",
+        description="Update lovely, Steamodded, Amulet, every mod (including ones installed by hand), and "
+        "balala itself. Each mod stays on its channel unless you pass -l or -s, which moves them all; "
+        "lovely and balala always move to their newest release.",
     )
     channels(sp, False)
     sub.add_parser("list", help="show what's installed", description="Show what's installed.")

@@ -43,6 +43,9 @@ pipx install git+https://github.com/a9lim/balala
 balala is one file with no dependencies, so you can also download `balala.py` from the
 [latest release](https://github.com/a9lim/balala/releases/latest) and run `python3 balala.py`.
 
+`balala update` keeps balala itself current too, through whichever of these you used. A git checkout is left for
+you to update.
+
 ## Usage
 
 | Command | |
@@ -50,7 +53,7 @@ balala is one file with no dependencies, so you can also download `balala.py` fr
 | `balala` | Launch Balatro with your mods. The first time, this runs `setup`. |
 | `balala setup [-l\|-s]` | Install lovely, Steamodded and Amulet. |
 | `balala install MOD... [-l\|-s] [-n NAME]` | Install mods by name or link. Installing a mod that's already there updates it. |
-| `balala update [-l\|-s]` | Update lovely, Steamodded, Amulet and every mod, including ones you installed by hand. |
+| `balala update [-l\|-s]` | Update lovely, Steamodded, Amulet, every mod (including ones you installed by hand), and balala itself. |
 | `balala list` | Show what's installed. |
 | `balala remove NAME...` | Remove mods. |
 | `balala logs [-f] [-n N]` | Show the game's latest lovely log; `-f` follows it as the game runs. |
@@ -93,7 +96,7 @@ with no Steamodded header, are listed and left alone.
   tag's source. A repo with no releases tracks its newest commit until it publishes one.
 
 `balala update` keeps each mod on the channel it was installed with. `update -l` or `update -s` moves everything
-to that channel. lovely is compiled, so it always uses its newest release.
+to that channel. lovely, which is compiled, and balala itself always move to their newest release.
 
 ## Platforms
 

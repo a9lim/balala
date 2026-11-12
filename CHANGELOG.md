@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 (2026-11-12)
+
+- `balala update` also updates balala to its newest release, the way it was installed: `uv tool`, pipx, pip, or the
+  single file. A git checkout is left alone.
+
 ## 0.1.0 (2026-11-12)
 
 First release.
