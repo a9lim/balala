@@ -13,4 +13,5 @@ First release.
 - `balala list`, `balala remove` and `balala logs [-f]`.
 - `-l/--latest` (the default) tracks the newest commit; `-s/--stable` uses the newest release. lovely is compiled, so
   it always uses its newest release.
+- Never deletes a mod folder it can't prove untouched; anything that might hold your work goes to a backups folder.
 - macOS, Windows and Linux (Steam + Proton). Stdlib-only Python 3.9+, plus git.

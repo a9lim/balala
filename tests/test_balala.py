@@ -88,8 +88,24 @@ class Upstream:
         sh("add", "-A", cwd=self.work)
         sh("commit", "-q", *(["--amend"] if amend else []), "-m", text, cwd=self.work)
 
-    def push(self, force: bool = False) -> None:
-        sh("push", "-q", *(["-f"] if force else []), "origin", "main", cwd=self.work)
+    def push(self, force: bool = False, branch: str = "main") -> None:
+        sh("push", "-q", *(["-f"] if force else []), "origin", branch, cwd=self.work)
+
+    def branch(self, name: str) -> None:
+        sh("switch", "-q", "-c", name, cwd=self.work)
+        self.commit(name)
+        self.push(branch=name)
+        sh("switch", "-q", "main", cwd=self.work)
+
+
+def head_of(clone: Path) -> tuple[str, str]:
+    return sh("rev-parse", "--abbrev-ref", "HEAD", cwd=clone), sh("log", "-1", "--format=%s", cwd=clone)
+
+
+def init_globals() -> None:
+    """Set up balala's ENV and STATE so tests can call its internals."""
+    balala.ENV = balala.Env()
+    balala.STATE = balala.load_state()
 
 
 # ── parsing ───────────────────────────────────────────────────────────────
@@ -217,6 +233,43 @@ def test_find_game_via_libraryfolders(tmp_path, monkeypatch):
     assert found.library == other
 
 
+@pytest.mark.parametrize(
+    "options, ok",
+    [
+        ('WINEDLLOVERRIDES="winmm=n,b" %command%', True),
+        ("WINEDLLOVERRIDES=winmm=n,b %command%", True),
+        ('WINEDLLOVERRIDES="version,winmm=n,b" %command%', True),
+        ('PROTON_LOG=1 WINEDLLOVERRIDES="d3d11=n;winmm=n" %command% -fullscreen', True),
+        ('WINEDLLOVERRIDES="winmm=b" %command%', False),  # builtin: lovely never loads
+        ('WINEDLLOVERRIDES="winmm=n,b"', False),  # no %command%: Steam ignores it
+        ("PROTON_LOG=1 %command%", False),
+    ],
+)
+def test_loads_native(options, ok):
+    assert balala.loads_native(options, ["winmm"]) is ok
+
+
+def test_launch_options_of_the_signed_in_account(tmp_path, monkeypatch):
+    steam = tmp_path / "Steam"
+    monkeypatch.setenv("BALALA_STEAM_DIR", str(steam))
+    for account, opts in (("11", 'WINEDLLOVERRIDES=\\"winmm=n,b\\" %command%'), ("22", "%command%")):
+        cfg = steam / "userdata" / account / "config/localconfig.vdf"
+        cfg.parent.mkdir(parents=True)
+        apps = f'"apps" {{ "2379780" {{ "LaunchOptions" "{opts}" }} }}'
+        cfg.write_text(f'"UserLocalConfigStore" {{ "Software" {{ "Valve" {{ "Steam" {{ {apps} }} }} }} }}')
+    (steam / "config").mkdir()
+
+    def sign_in(account: int) -> None:
+        steam_id = 76561197960265728 + account
+        (steam / "config/loginusers.vdf").write_text(f'"users" {{ "{steam_id}" {{ "MostRecent" "1" }} }}')
+
+    game = balala.Game(tmp_path / "game", tmp_path)
+    sign_in(22)
+    assert balala.Linux().hints(game, ["winmm.dll"])  # account 22 hasn't set the option
+    sign_in(11)
+    assert balala.Linux().hints(game, ["winmm.dll"]) == []
+
+
 def test_linux_prefix_and_launch_options(tmp_path, monkeypatch):
     linux = balala.Linux()
     lib = tmp_path / "lib"
@@ -276,6 +329,54 @@ def test_git_install_update_and_local_work(sandbox, tmp_path, capsys):
     assert (backup / "toy.lua").read_text() == "my edit"
 
 
+def test_kept_local_commit_survives_later_updates(sandbox, tmp_path, capsys):
+    seed_setup(sandbox)
+    up = Upstream(tmp_path)
+    run("install", up.url, "-n", "toy")
+    clone = sandbox.mods / "toy"
+    sh("commit", "-q", "--allow-empty", "-m", "mine", cwd=clone)
+    up.commit("v1b", amend=True)  # upstream diverges from the local commit
+    up.push(force=True)
+    for _ in range(2):  # the second update must not take the kept commit for balala's own
+        assert run("update") == 0
+        assert "local changes or commits" in capsys.readouterr().out
+        assert head_of(clone)[1] == "mine"
+    assert run("remove", "toy") == 0
+    (backup,) = (sandbox.data / "backups").iterdir()
+    assert head_of(backup)[1] == "mine"
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_untracked_and_ignored_files_are_preserved(sandbox, tmp_path, ignored):
+    up = Upstream(tmp_path)
+    run("install", up.url, "-n", "toy")
+    clone = sandbox.mods / "toy"
+    if ignored:
+        (clone / ".git/info/exclude").write_text("settings.lua\n")
+    (clone / "settings.lua").write_text("mine")
+    assert run("remove", "toy") == 0
+    (backup,) = (sandbox.data / "backups").iterdir()
+    assert (backup / "settings.lua").read_text() == "mine"
+
+
+def test_branch_link_and_back(sandbox, tmp_path):
+    up = Upstream(tmp_path)
+    up.branch("dev")
+    init_globals()
+    balala.ensure_mod(balala.Source(up.url, "git", "toy", branch="dev"), "latest")
+    assert head_of(sandbox.mods / "toy") == ("dev", "dev")
+    balala.ensure_mod(balala.Source(up.url, "git", "toy"), "latest")  # asking for the default branch switches back
+    assert head_of(sandbox.mods / "toy") == ("main", "v1")
+    assert not (sandbox.data / "backups").exists()  # the dev clone was balala's and untouched
+
+
+def test_case_variant_names_share_one_record(sandbox, tmp_path):
+    up = Upstream(tmp_path)
+    run("install", up.url, "-n", "toy")
+    run("install", up.url, "-n", "TOY")
+    assert list(state(sandbox)["mods"]) == ["toy"]
+
+
 def test_remove_clean_clone_deletes_it(sandbox, tmp_path):
     up = Upstream(tmp_path)
     run("install", up.url, "-n", "toy")
@@ -303,6 +404,41 @@ def test_update_keeps_each_mods_channel(sandbox, tmp_path, monkeypatch):
     assert seen == [("toy", "latest")]
 
 
+def test_update_before_setup_keeps_existing_core_channels(sandbox, monkeypatch):
+    sandbox.data.mkdir()
+    rec = {"source": "https://github.com/Steamodded/smods", "channel": "stable", "kind": "release", "ref": "1.0"}
+    (sandbox.data / "state.json").write_text(json.dumps({"mods": {"smods": rec}}))
+    seen = []
+    monkeypatch.setattr(
+        balala, "ensure_mod", lambda src, ch, name=None: seen.append((name, ch)) or balala.Result("current")
+    )
+    assert run("update") == 0
+    assert seen == [("smods", "stable"), ("amulet", "latest")]
+
+
+def test_filesystem_errors_fail_one_job_not_the_run(sandbox, monkeypatch, capsys):
+    seed_setup(sandbox)
+    st = state(sandbox)
+    st["mods"] = {
+        n: {"source": f"https://github.com/o/{n}", "channel": "latest", "kind": "git", "ref": "0" * 40}
+        for n in ("one", "two")
+    }
+    (sandbox.data / "state.json").write_text(json.dumps(st))
+    seen = []
+
+    def flaky(src, ch, name=None):
+        seen.append(name)
+        if name == "one":
+            raise PermissionError(13, "Permission denied", "/some/file.lua")
+        return balala.Result("current")
+
+    monkeypatch.setattr(balala, "ensure_mod", flaky)
+    assert run("update") == 1
+    out = capsys.readouterr().out
+    assert "✗ one" in out and "Permission denied" in out
+    assert seen == ["one", "two"]
+
+
 # ── mods from archives, folders and headers ───────────────────────────────
 
 
@@ -323,6 +459,26 @@ def test_archive_install_and_update(sandbox, tmp_path, capsys):
     make_zip(archive, {"thing.lua": "v2"})  # flat zips work too
     assert run("install", str(archive)) == 0
     assert (sandbox.mods / "Thing/thing.lua").read_text() == "v2"
+
+
+def test_edited_archive_install_is_backed_up(sandbox, tmp_path):
+    archive = make_zip(tmp_path / "Thing.zip", {"thing.lua": "v1"})
+    run("install", str(archive))
+    (sandbox.mods / "Thing/thing.lua").write_text("my tweak")
+    make_zip(archive, {"thing.lua": "v2"})
+    assert run("install", str(archive)) == 0
+    assert (sandbox.mods / "Thing/thing.lua").read_text() == "v2"
+    (backup,) = (sandbox.data / "backups").iterdir()
+    assert (backup / "thing.lua").read_text() == "my tweak"
+
+
+def test_same_archive_from_a_new_link_updates_the_source(sandbox, tmp_path):
+    old = make_zip(tmp_path / "old.zip", {"thing.lua": "v1"})
+    new = tmp_path / "new.zip"
+    new.write_bytes(old.read_bytes())
+    run("install", str(old), "-n", "Thing")
+    run("install", str(new), "-n", "Thing")
+    assert state(sandbox)["mods"]["Thing"]["source"] == new.resolve().as_uri()
 
 
 def test_unmanaged_folder_is_listed_and_backed_up(sandbox, capsys):

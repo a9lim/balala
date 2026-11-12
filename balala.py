@@ -11,6 +11,7 @@ nothing but the Python standard library (3.9+) and git.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -91,6 +92,11 @@ def tilde(path: Path) -> str:
     return "~" + s[len(home) :] if s == home or s.startswith(home + os.sep) else s
 
 
+def os_error(e: OSError) -> str:
+    where = f": {tilde(Path(e.filename))}" if e.filename else ""
+    return f"{e.strerror or e}{where}"
+
+
 def plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
@@ -135,6 +141,9 @@ def run_jobs(jobs: list[tuple[str, Callable[[], Result]]]) -> int:
             res = fn()
         except Fail as e:
             res = Result("failed", str(e))
+            failed += 1
+        except OSError as e:  # a file held open by the game or an editor, a full disk...
+            res = Result("failed", os_error(e))
             failed += 1
         finally:
             notes, _notes = _notes, None
@@ -342,20 +351,45 @@ class Linux(Platform):
         stems = [Path(f).stem.lower() for f in lovely_files if f.lower().endswith(".dll")]
         if not stems:
             return []
-        found = []
         for root in existing(steam_roots(self)):
-            for cfg in root.glob("userdata/*/config/localconfig.vdf"):
+            for cfg in _localconfigs(root):
                 try:
                     data = parse_vdf(cfg.read_text(encoding="utf-8", errors="replace"))
                 except OSError:
                     continue
                 opts = dig(data, "userlocalconfigstore", "software", "valve", "steam", "apps", APP_ID, "launchoptions")
-                if isinstance(opts, str):
-                    found.append(opts.lower())
-        if any("winedlloverrides" in o and all(s in o for s in stems) for o in found):
-            return []
+                if isinstance(opts, str) and loads_native(opts, stems):
+                    return []
         overrides = ";".join(f"{s}=n,b" for s in stems)
         return [f'in Steam, set Balatro\'s launch options to: WINEDLLOVERRIDES="{overrides}" %command%']
+
+
+def _localconfigs(steam: Path) -> list[Path]:
+    """The signed-in Steam account's localconfig.vdf, or every account's if that's unclear."""
+    try:
+        users = dig(parse_vdf((steam / "config/loginusers.vdf").read_text(encoding="utf-8", errors="replace")), "users")
+    except OSError:
+        users = None
+    for steam_id, user in (users or {}).items():
+        if isinstance(user, dict) and user.get("mostrecent") == "1" and steam_id.isdigit():
+            cfg = steam / "userdata" / str(int(steam_id) - 76561197960265728) / "config/localconfig.vdf"
+            if cfg.is_file():
+                return [cfg]
+    return sorted(steam.glob("userdata/*/config/localconfig.vdf"))
+
+
+def loads_native(launch_options: str, dlls: list[str]) -> bool:
+    """Whether Steam launch options make Wine load these DLLs natively (n before b), e.g.
+    WINEDLLOVERRIDES="winmm=n,b" %command%."""
+    m = re.search(r"WINEDLLOVERRIDES\s*=\s*(\"[^\"]*\"|'[^']*'|\S+)", launch_options, re.IGNORECASE)
+    if not m or "%command%" not in launch_options.lower():
+        return False
+    modes = {}
+    for entry in m.group(1).strip("\"'").split(";"):
+        names, _, mode = entry.partition("=")
+        for dll in names.split(","):
+            modes[dll.strip().lower()] = mode.strip().lower()
+    return all(modes.get(d, "").startswith("n") for d in dlls)
 
 
 def current_platform() -> Platform:
@@ -621,9 +655,19 @@ def rmtree(path: Path) -> None:
 def move(src: Path, dst: Path) -> None:
     try:
         os.replace(src, dst)
-    except OSError:  # across volumes
-        shutil.copytree(src, dst, symlinks=True)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.copytree(src, dst, symlinks=True)  # across volumes
         rmtree(src)
+
+
+def fingerprint(folder: Path) -> str:
+    """A hash of every file in a folder, to tell whether anyone has changed a mod since it was installed."""
+    h = hashlib.sha256()
+    for p in sorted((p for p in folder.rglob("*") if p.is_file()), key=lambda p: p.relative_to(folder).as_posix()):
+        h.update(p.relative_to(folder).as_posix().encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
 
 
 @contextmanager
@@ -686,18 +730,25 @@ def backup(path: Path) -> Path:
     return dest
 
 
+def has_local_work(target: Path, rec: dict | None) -> bool:
+    """Whether a mod folder might hold someone's work. When in doubt, yes."""
+    if rec is None:
+        return True  # balala didn't install it
+    if is_clone(target):
+        return git_has_local_work(target, rec.get("base", rec.get("ref")) if rec.get("kind") == "git" else None)
+    return rec.get("files") is None or fingerprint(target) != rec["files"]
+
+
 def clear_target(target: Path, rec: dict | None) -> None:
-    """Make room for a new install. Deletes balala's own copies; moves anything that
-    might hold someone's work (a folder balala didn't install, or a clone with
-    local edits or commits) to the backups folder instead."""
-    pristine = rec.get("ref") if rec and rec.get("kind") == "git" else None
+    """Make room for a new install. Deletes balala's own untouched copies; moves
+    anything that might hold someone's work to the backups folder instead."""
     if target.is_symlink():
         target.unlink()
     elif target.exists():
-        if rec is not None and not git_has_local_work(target, pristine):
-            rmtree(target)
-        else:
+        if has_local_work(target, rec):
             note(f"moved the old folder to {tilde(backup(target))}")
+        else:
+            rmtree(target)
 
 
 # ── git ───────────────────────────────────────────────────────────────────
@@ -725,22 +776,27 @@ def is_clone(path: Path) -> bool:
     return (path / ".git").exists()
 
 
-def git_dirty(path: Path) -> bool:
-    return bool(git("status", "--porcelain", "--untracked-files=no", cwd=path, check=False))
+def git_dirty(path: Path, untracked: bool = False) -> bool:
+    """Edits to tracked files (and, with `untracked`, new or ignored files too). True if git can't tell."""
+    args = ["status", "--porcelain", "--ignored" if untracked else "--untracked-files=no"]
+    r = _git(tuple(args), path)
+    return r.returncode != 0 or bool(r.stdout.strip())
 
 
-def git_has_local_work(path: Path, pristine: str | None = None) -> bool:
-    """Uncommitted edits, or commits upstream doesn't have. A clone still at
-    `pristine` (the commit balala left it on) can't have local commits, even if
-    upstream has rewritten its history since."""
-    if not is_clone(path):
-        return False
-    if git_dirty(path):
+def git_has_local_work(path: Path, base: str | None) -> bool:
+    """Any edits or files of the user's, or commits upstream doesn't have. A clone
+    still at `base` (the commit balala last put there) has no local commits, even
+    if upstream has rewritten its history since. Anything git can't answer counts
+    as work."""
+    if git_dirty(path, untracked=True):
         return True
-    if pristine and git("rev-parse", "HEAD", cwd=path, check=False) == pristine:
+    head = _git(("rev-parse", "HEAD"), path)
+    if head.returncode != 0:
+        return True
+    if base and head.stdout.strip() == base:
         return False
-    ahead = git("rev-list", "--count", "@{u}..HEAD", cwd=path, check=False)
-    return ahead.isdigit() and int(ahead) > 0
+    ahead = _git(("rev-list", "--count", "@{u}..HEAD"), path)
+    return ahead.returncode != 0 or int(ahead.stdout.strip() or 0) > 0
 
 
 def norm_remote(url: str) -> str:
@@ -875,25 +931,35 @@ def outcome(old: dict | None, new: dict) -> Result:
     return Result("updated", transition(describe(old), describe(new)))
 
 
-def record(name: str, src: Source, channel: str, kind: str, ref: str) -> dict:
+def record(
+    name: str, src: Source, channel: str, kind: str, ref: str, *, base: str | None = None, files: str | None = None
+) -> dict:
     rec = {
         "source": src.url,
         "branch": src.branch,  # what was asked for; None means the default branch
         "channel": channel,  # what was asked for: latest | stable
         "kind": kind,  # what's there: git | release | archive
-        "ref": ref,
+        "ref": ref,  # the commit checked out, or the tag / archive hash installed
         "updated": now(),
     }
     if kind == "git":
+        rec["base"] = base  # the last commit balala itself put there; None for a clone it adopted with work in it
         rec["on"] = git("rev-parse", "--abbrev-ref", "HEAD", cwd=ENV.mods / name, check=False)
+    else:
+        rec["files"] = files  # fingerprint of what balala unpacked, to spot later edits
     STATE["mods"][name] = rec
     save_state()
     return rec
 
 
+def canonical_name(name: str) -> str:
+    """Folder names are case-insensitive on macOS and Windows, so treat them that way everywhere."""
+    return next((k for k in STATE["mods"] if k.lower() == name.lower()), name)
+
+
 def ensure_mod(src: Source, channel: str, name: str | None = None) -> Result:
     """Install a mod, update it, or move it to another channel. Safe to repeat."""
-    name = check_name(name or src.name)
+    name = canonical_name(check_name(name or src.name))
     ENV.mods.mkdir(parents=True, exist_ok=True)
     target = ENV.mods / name
     rec = STATE["mods"].get(name)
@@ -921,10 +987,14 @@ def _install_archive(name: str, target: Path, src: Source, rec: dict | None) -> 
     with staging() as tmp:
         root, digest = fetch_archive(src.url, tmp)
         if rec and rec.get("kind") == "archive" and rec.get("ref") == digest and target.is_dir():
+            if rec["source"] != src.url:  # same files from a new link: update from the new one from now on
+                STATE["mods"][name] = {**rec, "source": src.url, "updated": now()}
+                save_state()
             return Result("current", describe(rec))
+        files = fingerprint(root)
         clear_target(target, rec)
         move(root, target)
-    return outcome(rec, record(name, src, "latest", "archive", digest))
+    return outcome(rec, record(name, src, "latest", "archive", digest, files=files))
 
 
 def _install_release(name: str, target: Path, src: Source, rel: dict, rec: dict | None) -> Result:
@@ -939,20 +1009,29 @@ def _install_release(name: str, target: Path, src: Source, rel: dict, rec: dict 
         return Result("current", tag)
     with staging() as tmp:
         root, _ = fetch_archive(release_archive_url(src.repo, rel), tmp)
+        files = fingerprint(root)
         clear_target(target, rec)
         move(root, target)
-    return outcome(rec, record(name, src, "stable", "release", tag))
+    return outcome(rec, record(name, src, "stable", "release", tag, files=files))
 
 
 def _install_git(name: str, target: Path, src: Source, rec: dict | None, channel: str) -> Result:
-    if is_clone(target) and same_remote(git("remote", "get-url", "origin", cwd=target, check=False), src.url):
+    # Reuse the clone if it's this repo on the branch asked for. (A clone of a /tree/ branch
+    # doesn't count when the default branch is asked for: that's a switch.)
+    same_ask = rec is None or rec.get("kind") != "git" or rec.get("branch") == src.branch
+    if (
+        same_ask
+        and is_clone(target)
+        and same_remote(git("remote", "get-url", "origin", cwd=target, check=False), src.url)
+    ):
         on = git("rev-parse", "--abbrev-ref", "HEAD", cwd=target, check=False)
         if not src.branch or on == src.branch:
             if rec is None:
                 note("adopted the clone that was already there")
-            pristine = rec["ref"] if rec and rec.get("kind") == "git" else None
-            status, old = _git_sync(target, pristine)
-            new = record(name, src, channel, "git", git("rev-parse", "HEAD", cwd=target))
+            base = rec.get("base", rec["ref"]) if rec and rec.get("kind") == "git" else None
+            status, old, head = _git_sync(target, base)
+            # After a sync, HEAD is upstream's, so it's a clean base. A kept clone keeps the old one.
+            new = record(name, src, channel, "git", head, base=base if status == "kept" else head)
             if status == "current":
                 return Result("current", describe(new))
             if status == "kept":
@@ -969,27 +1048,28 @@ def _install_git(name: str, target: Path, src: Source, rec: dict | None, channel
             raise
         clear_target(target, rec)
         move(dest, target)
-    return outcome(rec, record(name, src, channel, "git", git("rev-parse", "HEAD", cwd=target)))
+    head = git("rev-parse", "HEAD", cwd=target)
+    return outcome(rec, record(name, src, channel, "git", head, base=head))
 
 
-def _git_sync(path: Path, pristine: str | None) -> tuple[str, str]:
-    """Fast-forward a clone to upstream. If upstream rewrote its history, reset only
-    a clone that's exactly as balala left it: local work is never discarded."""
+def _git_sync(path: Path, base: str | None) -> tuple[str, str, str]:
+    """Fast-forward a clone to upstream; returns (status, old HEAD, new HEAD). If upstream
+    rewrote its history, reset only a clone that's exactly as balala left it, with
+    nothing of the user's in it: local work is never discarded."""
     git("fetch", "--quiet", "origin", cwd=path)
     head = git("rev-parse", "HEAD", cwd=path)
     up = git("rev-parse", "@{u}", cwd=path)
     if head == up:
-        return "current", head
-    dirty = git_dirty(path)
-    if not dirty and git_ok("merge-base", "--is-ancestor", head, up, cwd=path):
-        git("merge", "--ff-only", "--quiet", up, cwd=path)
-    elif not dirty and head == pristine:
+        return "current", head, head
+    if not git_dirty(path) and git_ok("merge-base", "--is-ancestor", head, up, cwd=path):
+        git("merge", "--ff-only", "--quiet", up, cwd=path)  # refuses by itself if it would clobber untracked files
+    elif head == base and not git_dirty(path, untracked=True):
         git("reset", "--hard", "--quiet", up, cwd=path)
         note("upstream rewrote its history; reset to match")
     else:
         note("has local changes or commits. Commit or discard them, or remove and reinstall it")
-        return "kept", head
-    return "updated", head
+        return "kept", head, head
+    return "updated", head, up
 
 
 # ── mod metadata (for dependency warnings) ────────────────────────────────
@@ -1111,11 +1191,15 @@ def ensure_lovely() -> Result:
 
 
 def _mod_job(name: str, channel: str | None) -> Callable[[], Result]:
-    # With no channel given, a mod keeps the one it was installed with.
-    return lambda: ensure_mod(source_for(name), channel or STATE["mods"][name]["channel"], name)
+    # With no channel given, a mod keeps the one it was installed with (new ones get latest).
+    def job() -> Result:
+        rec = STATE["mods"].get(name)
+        return ensure_mod(source_for(name), channel or (rec["channel"] if rec else "latest"), name)
+
+    return job
 
 
-def cmd_setup(channel: str) -> int:
+def cmd_setup(channel: str | None) -> int:
     failed = run_jobs([("lovely", ensure_lovely), *((n, _mod_job(n, channel)) for n in CORE)])
     if not failed:
         STATE["setup"] = now()  # from now on, a core mod you remove stays removed
@@ -1137,7 +1221,7 @@ def cmd_install(links: list[str], channel: str, name: str | None) -> int:
 
 def cmd_update(channel: str | None) -> int:
     if not STATE.get("setup"):  # never set up: setting up is the update
-        failed = cmd_setup(channel or "latest")
+        failed = cmd_setup(channel)
         rest = [n for n in STATE["mods"] if n not in CORE]
         return failed + (run_jobs([(n, _mod_job(n, channel)) for n in rest]) if rest else 0)
     names = [*(n for n in CORE if n in STATE["mods"]), *(n for n in STATE["mods"] if n not in CORE)]
@@ -1241,7 +1325,7 @@ def cmd_launch() -> int:
     game = ENV.game
     if not STATE.get("setup"):
         print("First run: setting up lovely, Steamodded and Amulet.")
-        if cmd_setup("latest"):
+        if cmd_setup(None):
             die("setup didn't finish, so Balatro wasn't launched")
     elif not lovely_present() and run_jobs([("lovely", ensure_lovely)]):
         # e.g. a Steam reinstall wiped it, and the game can't load mods without it
@@ -1373,6 +1457,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if failed else 0
     except Fail as e:
         error(str(e))
+        return 1
+    except OSError as e:
+        error(os_error(e))
         return 1
     except KeyboardInterrupt:
         print()

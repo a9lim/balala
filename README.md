@@ -100,10 +100,13 @@ with real mods, but the launch step hasn't been run against the real game yet. R
 - Its own state, under `~/Library/Application Support/balala` on macOS, `%LocalAppData%\balala` on Windows, and
   `~/.local/share/balala` on Linux.
 
-It's careful with your work. `update` only fast-forwards a git clone, and leaves any clone with uncommitted edits or
-local commits alone. If upstream rewrites its history, a clone balala hasn't touched since it put it there is reset
-to match. When a folder that might hold your work has to go (a folder balala didn't install, or a clone with edits),
-balala moves it to a `backups` folder next to its state instead of deleting it.
+It's careful with your work:
+
+- `update` only fast-forwards a git clone, and leaves any clone with uncommitted edits or local commits alone. If
+  upstream rewrites its history, a clone balala hasn't touched since it put it there is reset to match.
+- balala only deletes a mod folder it can prove is untouched: a clean clone with no new, ignored or committed
+  files of yours, or a release or archive install whose files still match what was unpacked. Anything else that has
+  to go, including any folder balala didn't install, is moved to a `backups` folder next to its state.
 
 Remove Steamodded or Amulet and they stay removed (`balala setup` brings them back). lovely is the exception: the
 game can't load mods without it, so a launch reinstalls it if it's missing, after a Steam reinstall for example.
